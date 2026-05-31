@@ -1,0 +1,8 @@
+/*
+ * ssr-block is a custom element used as a reactive patch wrapper by GoSSR.
+ * display:contents makes it invisible in layout — it has no box of its own,
+ * so child elements flow as if the wrapper does not exist.
+ */
+ssr-block {
+  display: contents;
+}
