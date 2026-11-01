@@ -81,4 +81,13 @@ export interface SsrClient<
    * Returns an unsubscribe function.
    */
   onError(callback: (varName: string, message: string) => void): () => void;
+
+  /**
+   * Stops the page's live connection for good, for every route on the page: the
+   * connection closes and never reconnects, waiting and in-flight calls reject
+   * with status 0, and every route's client stops as destroy() stops one. Fires
+   * no callback. Safe to call from any route's onDisconnect or onConnectError:
+   * the other routes still receive that event once.
+   */
+  stop(): void;
 }

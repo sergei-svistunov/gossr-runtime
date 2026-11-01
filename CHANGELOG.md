@@ -39,11 +39,23 @@ at run time: upgrade both together.
   calls reject with status 0 and later calls at once. A socket that opens resets the count.
 - `destroy()` removes the runtime's `ssr:bind` listeners; after it, `set()` warns and `call()` rejects with
   status 0.
+- `ssr.stop()`, on every client, ends the page's live connection for good for every route on the page: no
+  reconnect, calls reject with status 0, and every route's client stops as `destroy()` stops one. The
+  `onDisconnect` or `onConnectError` event that ended a connection reaches every route's handlers once, even
+  when an earlier handler calls `stop()`.
 - Two runtimes with the same route key on one page log a warning.
+- A second copy of the runtime on one page logs a warning: each copy opens its own connection. A webpack build
+  runs one copy per page only when its entries share one runtime (`optimization.runtimeChunk: 'single'`).
 - `package-lock.json` is committed, and the package ships its MIT `LICENSE`.
 
 ### Fixed
 
+- A value equal to the markup an element already holds — the markup last applied to it or, before any, the
+  markup the page was served with — leaves the element alone. Before, every init frame and every patch
+  replaced the block, which dropped its focus and DOM state such as an open `<details>`.
+- When a changed value replaces a block that holds the focused element, focus moves, without scrolling, to the
+  element at the same place in the new markup, if there is one that can take focus. Before, it fell to the
+  page's body.
 - `get()` and `on()` take a variable's name and find its value under the route's key; before, they looked up the
   bare name, which never matched. They return the string as received.
 - The echo of an `ssr:bind` value and the reset after a refused write set `checked` on checkboxes and radio

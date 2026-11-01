@@ -72,6 +72,8 @@ interface RuntimeHandlers {
   onConnect(): void;
   onDisconnect(code: number, reason: string): void;
   onConnectError(status: number): void;
+  // The connection was stopped for good.
+  onStop(): void;
 }
 
 interface Registration {
@@ -91,18 +93,56 @@ function connectionLost(): CallError {
   return new CallError(0, 'The connection was lost.');
 }
 
-// A textarea of an inert document: markup set on it is read as text, entities
-// are decoded, and nothing in it is ever loaded or run.
+// An inert document: markup parsed in it is never loaded or run.
+let inert: Document | null = null;
+
+function inertDocument(): Document {
+  if (!inert) inert = document.implementation.createHTMLDocument('');
+  return inert;
+}
+
+// A textarea of the inert document: markup set on it is read as text and
+// entities are decoded.
 let decoder: HTMLTextAreaElement | null = null;
 
 function decodeText(markup: string): string {
   if (typeof document === 'undefined') return markup;
-  if (!decoder) decoder = document.implementation.createHTMLDocument('').createElement('textarea');
+  if (!decoder) decoder = inertDocument().createElement('textarea');
   decoder.innerHTML = markup;
   return decoder.value;
 }
 
 type FormControl = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+
+function isFormControl(el: Element): el is FormControl {
+  return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement;
+}
+
+// The markup the runtime last applied to an element, and an element's markup as
+// the page had it before the runtime applied any. A block and the keys inside it
+// are compared independently, so a patch to an inner key leaves the block's
+// record stale; that is safe because the server renders a block and the keys
+// inside it from one state, and sends an inner key's change with or after the
+// block's own patch.
+const appliedMarkup = new WeakMap<Element, string>();
+const pageMarkup = new WeakMap<Element, string>();
+
+// Records the markup of the page's live elements, as the server rendered it.
+function rememberPageMarkup(): void {
+  document.querySelectorAll('[data-ssr-bind]').forEach((el) => {
+    if (!isFormControl(el) && !pageMarkup.has(el)) pageMarkup.set(el, el.innerHTML);
+  });
+}
+
+// Reports whether el already holds markup: the markup last applied to it, or,
+// before any, the page's markup for it, compared as the element serializes it.
+function holds(el: Element, markup: string): boolean {
+  const applied = appliedMarkup.get(el);
+  if (applied !== undefined) return applied === markup;
+  const probe = inertDocument().createElement(el.localName);
+  probe.innerHTML = markup;
+  return probe.innerHTML === (pageMarkup.get(el) ?? el.innerHTML);
+}
 
 function isChoice(el: Element): el is HTMLInputElement {
   return el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio');
@@ -120,15 +160,41 @@ function applyToControl(el: FormControl, markup: string): void {
   el.checked = el.type === 'checkbox' ? text === 'true' : text === el.value;
 }
 
+// The child-element indexes that lead from root down to node, or null when node
+// is not inside root.
+function pathFrom(root: Element, node: Element | null): number[] | null {
+  if (!node || node === root || !root.contains(node)) return null;
+  const path: number[] = [];
+  for (let n: Element = node; n !== root; n = n.parentElement!) {
+    path.unshift(Array.prototype.indexOf.call(n.parentElement!.children, n));
+  }
+  return path;
+}
+
+// Replaces el's markup. Focus inside el moves to the element at the same place
+// in the new markup; a browser ignores focus() on an element that cannot take
+// it, so focus is then left where the replacement put it.
+function replaceMarkup(el: Element, markup: string): void {
+  const path = pathFrom(el, document.activeElement);
+  el.innerHTML = markup;
+  if (!path) return;
+  let target: Element | undefined = el;
+  for (const i of path) target = target?.children[i];
+  if (target instanceof HTMLElement || target instanceof SVGElement) target.focus({ preventScroll: true });
+}
+
 // The value is markup the server escaped. A form control gets its decoded text
 // as state (a text control not while it has focus); any other element gets the
-// markup, and is returned.
+// markup unless it already holds it, and is returned when it got it.
 function applyToElement(el: Element, markup: string): Element | null {
-  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+  if (isFormControl(el)) {
     if (isChoice(el) || el !== document.activeElement) applyToControl(el, markup);
     return null;
   }
-  el.innerHTML = markup;
+  const unchanged = holds(el, markup);
+  appliedMarkup.set(el, markup);
+  if (unchanged) return null;
+  replaceMarkup(el, markup);
   return el;
 }
 
@@ -166,6 +232,9 @@ function applyToDocument(values: [string, unknown][]): Element[] {
 //   - ack: dispatched only to the handler registered for that routeKey.
 //   - result/fail: settle the page call with that id, if it was sent on the
 //     socket that delivered the frame; any other is ignored with a warning.
+//
+// Connect, disconnect and connect-error events reach every runtime registered
+// when the event happened, even when a handler stops the connection first.
 // ---------------------------------------------------------------------------
 
 class SharedWSConnection {
@@ -173,6 +242,8 @@ class SharedWSConnection {
   private retryCount = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
+  // Stopped for good by stop(): every runtime on it, and any registered later, is stopped.
+  private stopped = false;
   private everOpened = false;
   // Some socket of this connection has opened.
   private hasOpened = false;
@@ -207,6 +278,11 @@ class SharedWSConnection {
 
   constructor(private readonly wsUrl: string) {
     if (typeof document !== 'undefined') {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', rememberPageMarkup, { once: true });
+      } else {
+        rememberPageMarkup();
+      }
       document.addEventListener('visibilitychange', this.onVisibilityChange);
       if (document.visibilityState === 'hidden') {
         // Opened in a hidden tab: connect when it is first shown.
@@ -229,10 +305,15 @@ class SharedWSConnection {
 
   /**
    * Register a runtime's handlers under its routeKey. An empty routeKey (legacy
-   * single-route usage) registers under a stable key.
+   * single-route usage) registers under a stable key. On a stopped connection
+   * the runtime is stopped at once.
    */
   register(routeKey: string, handlers: RuntimeHandlers): Registration {
     const key = routeKey || '__legacy__';
+    if (this.stopped) {
+      handlers.onStop();
+      return { key, handlers };
+    }
     for (const r of this.runtimes) {
       if (r.key === key) {
         console.warn('[gossr] Two runtimes on this page share the route key "' + routeKey + '".');
@@ -255,6 +336,11 @@ class SharedWSConnection {
 
   private forEachHandlers(fn: (h: RuntimeHandlers) => void): void {
     this.runtimes.forEach((r) => fn(r.handlers));
+  }
+
+  // Runs fn for every runtime registered now, even one an earlier call stops.
+  private notifyAll(fn: (h: RuntimeHandlers) => void): void {
+    [...this.runtimes].forEach((r) => fn(r.handlers));
   }
 
   private forEachHandlersOf(key: string, fn: (h: RuntimeHandlers) => void): void {
@@ -346,7 +432,7 @@ class SharedWSConnection {
   private refuse(): void {
     this.finish();
     console.error('[gossr] WebSocket upgrade failed for: ' + this.wsUrl);
-    this.forEachHandlers((h) => h.onConnectError(0));
+    this.notifyAll((h) => h.onConnectError(0));
   }
 
   private connect(): void {
@@ -367,7 +453,7 @@ class SharedWSConnection {
       this.refusals = 0;
       this.openedAt = Date.now();
       this.waitingCalls.splice(0).forEach((frame) => this.sendCall(ws, gen, frame));
-      this.forEachHandlers((h) => h.onConnect());
+      this.notifyAll((h) => h.onConnect());
     });
 
     ws.addEventListener('message', (event: MessageEvent) => {
@@ -418,11 +504,11 @@ class SharedWSConnection {
 
       if (code === 1001) {
         this.finish();
-        this.forEachHandlers((h) => h.onDisconnect(code, reason));
+        this.notifyAll((h) => h.onDisconnect(code, reason));
         return;
       }
 
-      this.forEachHandlers((h) => h.onDisconnect(code, reason));
+      this.notifyAll((h) => h.onDisconnect(code, reason));
       if (code === StatusReauth && Date.now() - this.openedAt >= REAUTH_MIN_OPEN_MS) {
         this.connect();
         return;
@@ -542,7 +628,20 @@ class SharedWSConnection {
     if (replaced.length > 0) this.forEachHandlers((h) => h.onReplaced(replaced));
   }
 
-  destroy(): void {
+  /**
+   * Closes the connection for good and stops every runtime on it. It stays in
+   * the registry, so a runtime created for its URL later is stopped too.
+   */
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.destroy('stopped');
+    const runtimes = [...this.runtimes];
+    this.runtimes.clear();
+    runtimes.forEach((r) => r.handlers.onStop());
+  }
+
+  destroy(reason = 'destroyed'): void {
     this.destroyed = true;
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.onVisibilityChange);
@@ -553,7 +652,7 @@ class SharedWSConnection {
     }
     const ws = this.ws;
     this.ws = null;
-    ws?.close(1000, 'destroyed');
+    ws?.close(1000, reason);
     this.rejectAllCalls();
   }
 }
@@ -564,6 +663,18 @@ class SharedWSConnection {
 // ---------------------------------------------------------------------------
 
 const sharedConnections = new Map<string, SharedWSConnection>();
+
+// The registry is per copy of this module: a bundle that runs it more than once
+// on a page, one webpack runtime per entry, opens one connection per copy.
+const pageMark = Symbol.for('gossr-runtime');
+const pageGlobal = globalThis as Record<symbol, unknown>;
+if (pageGlobal[pageMark]) {
+  console.warn(
+    '[gossr] gossr-runtime runs more than once on this page, so each copy opens its own live connection. ' +
+      "Bundle the page's entries with one webpack runtime: optimization.runtimeChunk: 'single'.",
+  );
+}
+pageGlobal[pageMark] = true;
 
 /** Internal — returns the shared-connection registry. Used by tests only. */
 export function getSharedConnectionRegistry(): Map<string, SharedWSConnection> {
@@ -623,6 +734,7 @@ export class SsrRuntime<
       onConnect: () => this.fireConnect(),
       onDisconnect: (code, reason) => this.fireDisconnect(code, reason),
       onConnectError: (status) => this.fireConnectError(status),
+      onStop: () => this.close(),
     });
 
     // Wire ssr:bind elements after DOM is ready
@@ -647,7 +759,7 @@ export class SsrRuntime<
 
   set<K extends keyof W>(name: K, value: W[K]): void {
     if (this.destroyed) {
-      console.warn('[gossr] Ignoring set("' + String(name) + '") on a destroyed runtime.');
+      console.warn('[gossr] Ignoring set("' + String(name) + '") on a stopped or destroyed runtime.');
       return;
     }
     const frame: WriteFrame = {
@@ -704,9 +816,17 @@ export class SsrRuntime<
    */
   destroy(): void {
     if (this.destroyed) return;
+    this.close();
+    this.sharedConn.unregister(this.registration);
+  }
+
+  stop(): void {
+    this.sharedConn.stop();
+  }
+
+  private close(): void {
     this.destroyed = true;
     this.domListeners.abort();
-    this.sharedConn.unregister(this.registration);
   }
 
   // -------------------------------------------------------------------------

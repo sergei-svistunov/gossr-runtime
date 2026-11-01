@@ -69,6 +69,16 @@ export const ssr = createSsrClient<ReadVars, WriteVars, Calls>({
 every such page whether or not the route has an `index.ts`. `ssr-block.css` makes the wrapper elements the
 server renders around live values (`<ssr-block>`) take no part in layout.
 
+The routes of a page share one connection when they share one copy of the runtime. Bundle the page's entries
+with one webpack runtime, or each entry runs its own copy and opens its own connection (the runtime logs a
+warning when it runs twice on a page):
+
+```js
+optimization: {
+    runtimeChunk: 'single',
+},
+```
+
 ## API
 
 ```typescript
@@ -97,6 +107,9 @@ ssr.onConnect(() => { /* connected or reconnected */ });
 ssr.onDisconnect((code, reason) => { /* an open connection closed unexpectedly */ });
 ssr.onConnectError((status) => { /* the upgrade was refused; status is 0 */ });
 ssr.onError((varName, message) => { /* the server refused a write */ });
+
+// Stops the page's live connection for good, for every route on the page
+ssr.stop();
 ```
 
 - `get` and `on` take a bare variable name and give the string as received: escaped **markup**, not decoded
@@ -105,12 +118,15 @@ ssr.onError((varName, message) => { /* the server refused a write */ });
 - `set` sends any JSON value. The accepted value comes back as a patch; a write made while the connection is
   down is dropped. A refused write calls `onError`, or logs a warning when no handler is registered.
 - `onConnectError` always receives 0: browsers do not expose the status of a refused upgrade.
+- `stop` acts on the page, not on one route: every route's `ssr` shares the one connection, and calling `stop`
+  on any of them closes it for good. See [Stopping the page](#stopping-the-page).
 
 The package also exports `CallError`, `StatusReauth` (4000), the `SsrClient` and `Calls` types, the frame
 types (`InitFrame`, `PatchFrame`, `WriteFrame`, `AckFrame`, `ErrFrame`, `CallFrame`, `ResultFrame`,
 `FailFrame`, `ServerFrame`, `ClientFrame`), `createSsrClient` and `SsrRuntime`. `SsrRuntime.destroy()` removes
-the runtime's `ssr:bind` listeners and leaves the shared connection, which closes when no runtime is left on
-it; after it, `set` warns and `call` rejects with status 0.
+one runtime's `ssr:bind` listeners and leaves the shared connection, which closes when no runtime is left on
+it; after it, `set` warns and `call` rejects with status 0. To end the page's connection while other routes
+are still on it, use `stop()`.
 
 ## Live values in the DOM
 
@@ -123,6 +139,17 @@ binding key. The runtime applies it to every element whose `data-ssr-bind` names
   checked when the text equals its own value, which is never rewritten;
 - a text control that has focus is not overwritten while the user types; a checkbox or radio button is set
   whether or not it has focus.
+
+An element that is not a form control is left alone when the value equals the markup it already holds: the
+markup the runtime last applied to it or, before any, the markup the page was served with, compared as the
+element serializes it. The init frame after every connect and reconnect, and a patch that repeats a value,
+therefore keep the elements, their focus and their DOM state, such as an open `<details>`. `on` listeners still
+run for every init and patch.
+
+A value that changes the markup replaces the element's contents. When the focused element was inside it, focus
+moves, without scrolling, to the element at the same place in the new markup: the same child-element index at
+every level down from the bound element. When no element is there, or the one there cannot take focus, focus
+is left where the replacement put it. Focus outside the element is never moved.
 
 ## ssr:bind
 
@@ -139,9 +166,9 @@ The runtime wires every `input`, `select` and `textarea` with an `ssr:bind="name
 
 When a page has one route, an `ssr:bind` element without `data-ssr-route` belongs to it.
 
-A live value that re-renders a block replaces the elements inside it. The runtime wires the `ssr:bind`
+A live value that changes a block replaces the elements inside it. The runtime wires the `ssr:bind`
 elements of the new markup after each render, once each, with the same `data-ssr-route` rule; what the user
-had typed into the replaced element, and its focus, are gone.
+had typed into the replaced element is gone, and its focus moves as described in "Live values in the DOM".
 
 ## Page calls
 
@@ -193,6 +220,29 @@ usually means the session has ended or the page's guards now refuse it. Reload t
 
 ```typescript
 ssr.onConnectError(() => location.reload());
+```
+
+## Stopping the page
+
+`ssr.stop()` ends the page's live connection for good. Every route's `ssr` on the page shares that connection,
+so any of them can stop it:
+
+- the socket closes with 1000 and the runtime never reconnects, also not when the tab is shown again;
+- calls waiting or in flight reject with status 0, and later calls reject at once;
+- every route's client stops as `destroy()` stops one: its `ssr:bind` listeners are removed and `set` warns;
+- no callback fires for the stop itself.
+
+The event that ended the connection — `onDisconnect` or `onConnectError` — reaches every route's handlers once,
+even when an earlier handler calls `stop()`. So one route's handler can stop the page and show its own message
+instead of letting the runtime reconnect, for example after a 1008:
+
+```typescript
+ssr.onDisconnect((code) => {
+  if (code === 1008) {
+    ssr.stop();
+    showSignedOut();
+  }
+});
 ```
 
 ## Frames

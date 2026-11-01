@@ -20,13 +20,16 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Destroy leftover connections so they stop watching the tab.
-  clearRegistry();
-  Reflect.deleteProperty(document, 'visibilityState');
-  Reflect.deleteProperty(document, 'hidden');
-  teardown();
-  vi.restoreAllMocks();
-  vi.useRealTimers();
+  try {
+    // Destroy leftover connections so they stop watching the tab.
+    clearRegistry();
+    Reflect.deleteProperty(document, 'visibilityState');
+    Reflect.deleteProperty(document, 'hidden');
+    teardown();
+  } finally {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  }
 });
 
 // Helper: create a runtime and immediately open the WS connection
@@ -1894,5 +1897,164 @@ describe('ssr:bind inside a block rendered live', () => {
     type('Ann');
     expect(writes()).toEqual([]);
     other.destroy();
+  });
+});
+
+describe('unchanged markup', () => {
+  it('an init equal to the page leaves the block and its focus in place', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="k"><a href="/next">Next</a></ssr-block>';
+    const link = document.querySelector('a')!;
+    link.focus();
+    const rt = makeRuntime();
+    sendInit({ k: '<a href="/next">Next</a>' });
+    expect(document.querySelector('a')).toBe(link);
+    expect(document.activeElement).toBe(link);
+    rt.destroy();
+  });
+
+  it('an init equal to the page keeps what the user opened before it', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="k"><details><summary>More</summary></details></ssr-block>';
+    const rt = makeRuntime();
+    document.querySelector('details')!.open = true;
+    sendInit({ k: '<details><summary>More</summary></details>' });
+    expect(document.querySelector('details')!.open).toBe(true);
+    rt.destroy();
+  });
+
+  it('changed markup replaces the block', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="k"><a href="/next">Next</a></ssr-block>';
+    const link = document.querySelector('a')!;
+    const rt = makeRuntime();
+    sendInit({ k: '<a href="/next">Later</a>' });
+    expect(document.querySelector('a')).not.toBe(link);
+    expect(document.querySelector('a')!.textContent).toBe('Later');
+    rt.destroy();
+  });
+
+  it('a patch or a reconnect init with the markup last applied does nothing', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<ssr-block data-ssr-bind="k"></ssr-block>';
+    const rt = makeRuntime();
+    const markup = '<details><summary>More</summary></details>';
+    sendInit({ k: markup });
+    const details = document.querySelector('details')!;
+    details.open = true;
+    sendPatch('k', markup);
+    latestMockWs().serverClose(1006, '');
+    vi.advanceTimersByTime(2000);
+    latestMockWs().serverOpen();
+    sendInit({ k: markup });
+    expect(document.querySelector('details')).toBe(details);
+    expect(details.open).toBe(true);
+    rt.destroy();
+  });
+});
+
+describe('focus in a replaced block', () => {
+  const block = '<ssr-block data-ssr-bind="k"><p>3 open</p><nav><a href="/a">All</a><a href="/o">Open (3)</a></nav></ssr-block>';
+
+  it('moves to the element at the same place in the new markup', () => {
+    document.body.innerHTML = block;
+    const old = document.querySelectorAll('a')[1];
+    old.focus();
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+    const rt = makeRuntime();
+    sendInit({ k: '<p>4 open</p><nav><a href="/a">All</a><a href="/o">Open (4)</a></nav>' });
+    expect(document.activeElement).not.toBe(old);
+    expect(document.activeElement!.textContent).toBe('Open (4)');
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+    rt.destroy();
+  });
+
+  it('stays where it was when it was outside the block', () => {
+    document.body.innerHTML = '<button>Save</button>' + block;
+    const button = document.querySelector('button')!;
+    button.focus();
+    const rt = makeRuntime();
+    sendInit({ k: '<p>4 open</p><nav><a href="/a">All</a><a href="/o">Open (4)</a></nav>' });
+    expect(document.activeElement).toBe(button);
+    rt.destroy();
+  });
+
+  it.each([
+    ['is gone', '<p>0 open</p><nav><a href="/a">All</a></nav>'],
+    ['cannot take focus', '<p>0 open</p><nav><a href="/a">All</a><span>Open (0)</span></nav>'],
+  ])('is left alone when the element at its place %s', (_, markup) => {
+    document.body.innerHTML = block;
+    document.querySelectorAll('a')[1].focus();
+    const rt = makeRuntime();
+    sendInit({ k: markup });
+    expect(document.activeElement).toBe(document.body);
+    rt.destroy();
+  });
+});
+
+describe('stop', () => {
+  type Client = SsrRuntime<Record<string, unknown>, Record<string, never>, { ping: { in: object; out: unknown } }>;
+
+  function client(routeKey: string): Client {
+    return new SsrRuntime('ws://localhost/__ws', routeKey);
+  }
+
+  function twoClients(): { root: Client; home: Client } {
+    return { root: client('3f7a'), home: client('9d1e') };
+  }
+
+  it('ends the connection for every client on it for good', async () => {
+    vi.useFakeTimers();
+    const { root, home } = twoClients();
+    const ws = latestMockWs();
+    ws.serverOpen();
+    const callback = vi.fn();
+    [root, home].forEach((c) => { c.onDisconnect(callback); c.onConnectError(callback); });
+    const call = root.call('ping', {});
+    home.stop();
+    expect(ws.clientClose).toEqual({ code: 1000, reason: 'stopped' });
+    await expect(call).rejects.toMatchObject({ status: 0 });
+    await expect(root.call('ping', {})).rejects.toMatchObject({ status: 0 });
+    setVisibility('hidden');
+    setVisibility('visible');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    expect(callback).not.toHaveBeenCalled();
+    root.destroy();
+    expect(getSharedConnectionRegistry().size).toBe(1);
+  });
+
+  it('a stop in one client\'s onDisconnect lets every client hear the close once and stops the reconnect', () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { root, home } = twoClients();
+    const rootCb = vi.fn(() => root.stop());
+    const homeCb = vi.fn();
+    root.onDisconnect(rootCb);
+    home.onDisconnect(homeCb);
+    latestMockWs().serverOpen();
+    latestMockWs().serverClose(1008, 'refused');
+    vi.advanceTimersByTime(60_000);
+    expect(rootCb.mock.calls).toEqual([[1008, 'refused']]);
+    expect(homeCb.mock.calls).toEqual([[1008, 'refused']]);
+    expect(mockWsInstances).toHaveLength(1);
+  });
+
+  it('a stop in one client\'s onConnectError lets every client hear the refusal once', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { root, home } = twoClients();
+    const rootCb = vi.fn(() => root.stop());
+    const homeCb = vi.fn();
+    root.onConnectError(rootCb);
+    home.onConnectError(homeCb);
+    latestMockWs().serverError();
+    latestMockWs().serverClose(1006, '');
+    expect(rootCb.mock.calls).toEqual([[0]]);
+    expect(homeCb.mock.calls).toEqual([[0]]);
+  });
+
+  it('a client created after stop opens nothing', async () => {
+    const { home } = twoClients();
+    home.stop();
+    const late = client('5c2b');
+    expect(mockWsInstances).toHaveLength(1);
+    await expect(late.call('ping', {})).rejects.toMatchObject({ status: 0 });
   });
 });
