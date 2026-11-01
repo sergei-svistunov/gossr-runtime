@@ -139,6 +139,10 @@ The runtime wires every `input`, `select` and `textarea` with an `ssr:bind="name
 
 When a page has one route, an `ssr:bind` element without `data-ssr-route` belongs to it.
 
+A live value that re-renders a block replaces the elements inside it. The runtime wires the `ssr:bind`
+elements of the new markup after each render, once each, with the same `data-ssr-route` rule; what the user
+had typed into the replaced element, and its focus, are gone.
+
 ## Page calls
 
 `ssr.call(name, args)` sends a call frame with a fresh id and resolves with the call's result, or rejects with
@@ -153,7 +157,7 @@ The runtime never retries a call. A call made before the connection opens, or wh
 tab is hidden, waits; every waiting call is sent at once when the next socket opens, and the server answers
 those over its limit of 4 at a time with 429. Calls already sent on a socket that closes reject with status 0,
 including when the tab is hidden. After the tab is shown again, each refused reconnect rejects the calls
-waiting at that moment.
+waiting at that moment, and once the connection is closed for good later calls reject at once.
 
 Call ids count up for the page across reconnects. An answer to a call that was not sent on the socket that
 delivered it is ignored with a warning.
@@ -168,21 +172,24 @@ delivered it is ignored with a warning.
 | close 1008 | logs a warning with the server's reason, `onDisconnect`, reconnects with back-off |
 | any other close (1006, 1011, …) | `onDisconnect`, reconnects with back-off |
 | tab hidden | closes the socket itself, without `onDisconnect`, and rejects the calls in flight |
-| tab shown | reopens the connection; a refused upgrade then retries with back-off |
-| upgrade refused | final, unless it is a reopening after the tab was shown: `onConnectError(0)`, every waiting call rejects |
+| tab shown | reopens the connection; a refused upgrade then retries with back-off, and the third refused upgrade in a row is final |
+| upgrade refused | final, unless it is a reopening after the tab was shown and fewer than 3 upgrades in a row were refused: `onConnectError(0)`, every waiting call rejects with status 0 and later calls reject at once |
 
 The server closes every connection after 10 minutes with 4000, and the reconnect passes its checks again. It
-closes with 1008 when a `Subscribe` refuses the session, when a route guard refuses a call (after that call's
-fail frame), or when the client is too slow to read; the reconnect that follows passes the guards again or is
-refused.
+closes with 1008 when a `Subscribe` refuses the session or when a route guard refuses a call (after that call's
+fail frame); the reconnect that follows passes the guards again or is refused. A client that takes more than 10
+seconds to accept a frame is disconnected without a close frame it can read (1006), and reconnects with
+back-off.
 
 Back-off starts at 1 second and doubles up to 30 seconds, with ±10% jitter; after 5 failed attempts in a row
 each further one logs a warning. A valid init frame resets it.
 
 A page opened in a hidden tab connects when the tab is first shown, and a refused upgrade then is final.
 
-A refused upgrade — the first one, or one after a drop — usually means the session has ended or the page's
-guards now refuse it. Reload the page in `onConnectError`, so the server can send the user to sign in:
+A socket that opens resets the count of refused upgrades.
+
+A final refused upgrade — the first one, one after a drop, or the third in a row after the tab is shown again —
+usually means the session has ended or the page's guards now refuse it. Reload the page in `onConnectError`, so the server can send the user to sign in:
 
 ```typescript
 ssr.onConnectError(() => location.reload());

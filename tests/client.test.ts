@@ -1450,6 +1450,56 @@ describe('hidden tab', () => {
     rt.destroy();
   });
 
+  it('three refused upgrades in a row after the tab is shown again are final', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const rt = makeRuntime();
+    const connectErrorCb = vi.fn();
+    rt.onConnectError(connectErrorCb);
+    setVisibility('hidden');
+    setVisibility('visible');
+
+    for (const wait of [1200, 2400]) {
+      latestMockWs().serverError();
+      latestMockWs().serverClose(1006, '');
+      vi.advanceTimersByTime(wait);
+    }
+    expect(connectErrorCb).not.toHaveBeenCalled();
+    const waiting = rt.call('x' as never, null as never);
+    latestMockWs().serverError();
+    latestMockWs().serverClose(1006, '');
+    await expect(waiting).rejects.toMatchObject({ status: 0 });
+    await expect(rt.call('x' as never, null as never)).rejects.toMatchObject({ status: 0 });
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(4);
+    expect(connectErrorCb).toHaveBeenCalledExactlyOnceWith(0);
+    expect(errorSpy).toHaveBeenCalledOnce();
+    rt.destroy();
+  });
+
+  it('an open socket resets the count of refused upgrades', () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rt = makeRuntime();
+    const connectErrorCb = vi.fn();
+    rt.onConnectError(connectErrorCb);
+    for (let round = 0; round < 2; round++) {
+      setVisibility('hidden');
+      setVisibility('visible');
+      for (const wait of [1200, 2400]) {
+        latestMockWs().serverError();
+        latestMockWs().serverClose(1006, '');
+        vi.advanceTimersByTime(wait);
+      }
+      latestMockWs().serverOpen();
+      sendInit({});
+    }
+    expect(mockWsInstances).toHaveLength(7);
+    expect(connectErrorCb).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
   it('a refused first upgrade in a tab hidden at load stays final', () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -1790,5 +1840,59 @@ describe('ssr:bind echo', () => {
     expect(radio.checked).toBe(true);
     expect(radio.value).toBe('fast');
     rt.destroy();
+  });
+});
+
+describe('ssr:bind inside a block rendered live', () => {
+  function writes(): unknown[] {
+    return latestMockWs().sentMessages.map((m) => JSON.parse(m));
+  }
+
+  function type(value: string): void {
+    const input = document.querySelector('input')!;
+    input.value = value;
+    input.dispatchEvent(new Event('input'));
+  }
+
+  it('wires the controls of each new render once and echoes into them', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="3f7a.b1"><input ssr:bind="name" type="text" /></ssr-block>';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const inner = '<span data-ssr-bind="3f7a.b2"></span>';
+    sendInit({ '3f7a.b1': inner, '3f7a.b2': '<input ssr:bind="name" type="text" />' }, '3f7a');
+    type('Ann');
+    sendPatch('3f7a.b1', '<input ssr:bind="name" type="text" />', '3f7a');
+    type('Bob');
+    expect(writes()).toEqual([
+      { t: 'write', routeKey: '3f7a', var: 'name', value: 'Ann' },
+      { t: 'write', routeKey: '3f7a', var: 'name', value: 'Bob' },
+    ]);
+    sendPatch('3f7a.name', 'Carol', '3f7a');
+    expect(document.querySelector('input')!.value).toBe('Carol');
+    rt.destroy();
+  });
+
+  it('keeps the route that owns a control', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="3f7a.b1"></ssr-block>';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    latestMockWs().serverOpen();
+    sendPatch('3f7a.b1', '<input ssr:bind="displayName" data-ssr-route="9d1e" type="text" />', '3f7a');
+    type('Alice');
+    sendPatch('3f7a.b1', '<input ssr:bind="displayName" type="text" />', '3f7a');
+    type('Bob');
+    expect(writes()).toEqual([{ t: 'write', routeKey: '9d1e', var: 'displayName', value: 'Alice' }]);
+    root.destroy();
+    home.destroy();
+  });
+
+  it('stops wiring after destroy', () => {
+    document.body.innerHTML = '<ssr-block data-ssr-bind="b"></ssr-block>';
+    const other = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    rt.destroy();
+    sendPatch('b', '<input ssr:bind="name" data-ssr-route="3f7a" type="text" />');
+    type('Ann');
+    expect(writes()).toEqual([]);
+    other.destroy();
   });
 });

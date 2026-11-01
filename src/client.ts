@@ -44,6 +44,8 @@ const RECONNECT_WARN_AFTER = 5; // emit console.warn after this many consecutive
 // A 4000 close reconnects at once only after the connection was open this long;
 // sooner, it waits the back-off, so a server that answers 4000 at once cannot loop.
 const REAUTH_MIN_OPEN_MS = 30_000;
+// After the tab is shown again, this many refused upgrades in a row are final.
+const RESUME_MAX_REFUSALS = 3;
 
 // Input types that use the 'input' event (real-time, per-keystroke)
 const INPUT_EVENT_TYPES = new Set([
@@ -65,6 +67,8 @@ type BindingCallback = (value: string) => void;
 // Handlers registered per SsrRuntime into the shared connection
 interface RuntimeHandlers {
   onMessage(frame: ServerFrame): void;
+  // Elements whose markup a frame replaced, after onMessage.
+  onReplaced(elements: Element[]): void;
   onConnect(): void;
   onDisconnect(code: number, reason: string): void;
   onConnectError(status: number): void;
@@ -118,13 +122,29 @@ function applyToControl(el: FormControl, markup: string): void {
 
 // The value is markup the server escaped. A form control gets its decoded text
 // as state (a text control not while it has focus); any other element gets the
-// markup.
-function applyToElement(el: Element, markup: string): void {
+// markup, and is returned.
+function applyToElement(el: Element, markup: string): Element | null {
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
     if (isChoice(el) || el !== document.activeElement) applyToControl(el, markup);
-    return;
+    return null;
   }
   el.innerHTML = markup;
+  return el;
+}
+
+// Applies values to the elements of their binding keys and returns the elements
+// whose markup was replaced.
+function applyToDocument(values: [string, unknown][]): Element[] {
+  const replaced: Element[] = [];
+  if (typeof document === 'undefined') return replaced;
+  for (const [key, html] of values) {
+    if (typeof html !== 'string') continue;
+    document.querySelectorAll('[data-ssr-bind="' + cssEscape(key) + '"]').forEach((el) => {
+      const block = applyToElement(el, html);
+      if (block) replaced.push(block);
+    });
+  }
+  return replaced;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +156,9 @@ function applyToElement(el: Element, markup: string): void {
 //
 // Each SsrRuntime registers a RuntimeHandlers object; the shared connection
 // dispatches frames to the correct handler:
-//   - init/patch: broadcast to ALL registered handlers (each runtime applies
-//     only the bindings whose keys start with its own routeKey or are in its
-//     bindings map; since bindings are self-identifying via routeKey.localKey
-//     prefixes, all registered handlers receive every frame and cherry-pick).
+//   - init/patch: applied to the document once, then broadcast to ALL
+//     registered handlers, which store the values and notify their listeners,
+//     then to their onReplaced with the elements whose markup was replaced.
 //   - err with code "unknown_route" and routeKey "": logged with console.warn,
 //     NOT dispatched to any handler (internal protocol error, not validation feedback).
 //   - err with a specific routeKey: dispatched only to the handler registered
@@ -158,12 +177,16 @@ class SharedWSConnection {
   // Some socket of this connection has opened.
   private hasOpened = false;
   // A refused upgrade waits the back-off instead of going final: set when the
-  // tab is shown again after an open connection, cleared when a socket opens.
+  // tab is shown again after an open connection, cleared when a socket opens
+  // or when RESUME_MAX_REFUSALS upgrades in a row are refused.
   private retryRefusedUpgrade = false;
+  // Upgrades refused in a row since a socket last opened.
+  private refusals = 0;
   private openedAt = 0;
   // Closed by us while the tab is hidden; reopened when it is shown again.
   private paused = false;
-  // Closed for good: by the server (1000, 1001) or by a refused upgrade.
+  // Closed for good: by the server (1000, 1001) or by a refused upgrade (after
+  // the tab is shown again, by RESUME_MAX_REFUSALS of them in a row).
   private finished = false;
   // Counts the sockets of this connection; the current socket has this number.
   private generation = 0;
@@ -319,6 +342,13 @@ class SharedWSConnection {
     this.rejectAllCalls();
   }
 
+  // Closes for good after a refused upgrade.
+  private refuse(): void {
+    this.finish();
+    console.error('[gossr] WebSocket upgrade failed for: ' + this.wsUrl);
+    this.forEachHandlers((h) => h.onConnectError(0));
+  }
+
   private connect(): void {
     if (this.destroyed) return;
 
@@ -334,6 +364,7 @@ class SharedWSConnection {
       this.everOpened = true;
       this.hasOpened = true;
       this.retryRefusedUpgrade = false;
+      this.refusals = 0;
       this.openedAt = Date.now();
       this.waitingCalls.splice(0).forEach((frame) => this.sendCall(ws, gen, frame));
       this.forEachHandlers((h) => h.onConnect());
@@ -345,12 +376,8 @@ class SharedWSConnection {
 
     ws.addEventListener('error', () => {
       if (ws !== this.ws || this.paused || this.retryRefusedUpgrade) return;
-      if (!this.everOpened) {
-        this.finish();
-        console.error('[gossr] WebSocket upgrade failed for: ' + this.wsUrl);
-        this.forEachHandlers((h) => h.onConnectError(0));
-        // Do not reconnect: cannot distinguish 4xx from 5xx at the WebSocket API level.
-      }
+      // Do not reconnect: cannot distinguish 4xx from 5xx at the WebSocket API level.
+      if (!this.everOpened) this.refuse();
     });
 
     ws.addEventListener('close', (event: CloseEvent) => {
@@ -365,6 +392,11 @@ class SharedWSConnection {
 
       if (!this.everOpened) {
         if (this.retryRefusedUpgrade) {
+          if (++this.refusals >= RESUME_MAX_REFUSALS) {
+            this.retryRefusedUpgrade = false;
+            this.refuse();
+            return;
+          }
           this.rejectWaitingCalls();
           this.scheduleReconnect();
           return;
@@ -469,13 +501,11 @@ class SharedWSConnection {
         }
         // Reset retry counter when a valid init is received — connection fully established.
         this.retryCount = 0;
-        // Broadcast to all registered handlers; each cherry-picks its own bindings.
-        this.forEachHandlers((h) => h.onMessage(frame));
+        this.applyValues(frame, Object.entries(frame.bindings));
         break;
 
       case 'patch':
-        // Broadcast to all registered handlers; each cherry-picks relevant binding keys.
-        this.forEachHandlers((h) => h.onMessage(frame));
+        this.applyValues(frame, [[frame.key, frame.html]]);
         break;
 
       case 'ack':
@@ -504,6 +534,12 @@ class SharedWSConnection {
       default:
         console.warn('[gossr] Unknown frame type received; ignoring.');
     }
+  }
+
+  private applyValues(frame: ServerFrame, values: [string, unknown][]): void {
+    const replaced = applyToDocument(values);
+    this.forEachHandlers((h) => h.onMessage(frame));
+    if (replaced.length > 0) this.forEachHandlers((h) => h.onReplaced(replaced));
   }
 
   destroy(): void {
@@ -567,6 +603,8 @@ export class SsrRuntime<
   private destroyed = false;
   // Aborted by destroy() to remove this runtime's DOM listeners.
   private readonly domListeners = new AbortController();
+  // The ssr:bind controls this runtime has wired.
+  private readonly wired = new WeakSet<Element>();
   private readonly sharedConn: SharedWSConnection;
   private readonly registration: Registration;
 
@@ -579,6 +617,9 @@ export class SsrRuntime<
 
     this.registration = this.sharedConn.register(routeKey, {
       onMessage: (frame) => this.handleFrame(frame),
+      onReplaced: (elements) => elements.forEach((el) => {
+        if (!this.destroyed && el.isConnected) this.wireSsrBindElements(el);
+      }),
       onConnect: () => this.fireConnect(),
       onDisconnect: (code, reason) => this.fireDisconnect(code, reason),
       onConnectError: (status) => this.fireConnectError(status),
@@ -675,10 +716,8 @@ export class SsrRuntime<
   private handleFrame(frame: ServerFrame): void {
     switch (frame.t) {
       case 'init':
-        // Apply all bindings from the init snapshot (spec section 4, init frame).
-        // Each runtime applies all bindings — applyBinding stores them in the map
-        // keyed by full namespaced key. DOM dispatch uses querySelectorAll which
-        // naturally matches only the elements that exist in this route's HTML.
+        // The shared connection has applied the values to the document; each
+        // runtime stores all of them, keyed by full namespaced key.
         for (const [key, html] of Object.entries(frame.bindings)) {
           this.applyBinding(key, html);
         }
@@ -713,13 +752,6 @@ export class SsrRuntime<
       return;
     }
     this.bindings.set(key, html);
-
-    if (typeof document !== 'undefined') {
-      const selector = '[data-ssr-bind="' + cssEscape(key) + '"]';
-      document.querySelectorAll(selector).forEach((el) => {
-        applyToElement(el, html);
-      });
-    }
 
     // Notify per-key subscribers (ssr.on handlers).
     // For ssr.on, developers use short variable names (e.g. "counter").
@@ -776,22 +808,26 @@ export class SsrRuntime<
   }
 
   /**
-   * Discovers all [ssr:bind] elements and wires them bidirectionally:
+   * Discovers the [ssr:bind] elements in root and wires each one not yet wired
+   * bidirectionally:
    *  - element change/input event -> sends write frame to server
    *  - server patch -> updates element .value
    *
-   * Called once after DOMContentLoaded (or immediately if DOM is already ready).
+   * Called for the document after DOMContentLoaded (or immediately if DOM is
+   * already ready), and for each element whose markup a frame replaced. The echo
+   * of a control wired inside such an element stops once it leaves the document.
    */
-  private wireSsrBindElements(): void {
+  private wireSsrBindElements(root?: Element): void {
     if (typeof document === 'undefined') return;
 
     // Use getAttribute-based iteration instead of a CSS [ssr\:bind] selector.
     // The colon in the attribute name is a CSS namespace separator, which causes
     // querySelectorAll('[ssr\\:bind]') to return 0 elements in jsdom and may also
     // fail in certain browser CSS parser implementations.
-    document.querySelectorAll<FormControl>('input, select, textarea').forEach((el) => {
+    (root ?? document).querySelectorAll<FormControl>('input, select, textarea').forEach((el) => {
       const varName = el.getAttribute('ssr:bind');
-      if (!varName) return;
+      if (!varName || this.wired.has(el)) return;
+      this.wired.add(el);
 
       const tag = el.tagName.toLowerCase();
       const event = this.chooseBindEvent(el, tag);
@@ -805,7 +841,11 @@ export class SsrRuntime<
 
       // server -> element: apply a patch for this route's variable, but not to a
       // text control while it has focus
-      this.on(varName as keyof R, (value: string) => {
+      const off = this.on(varName as keyof R, (value: string) => {
+        if (root && !el.isConnected) {
+          off();
+          return;
+        }
         if (!this.claimsInput(el)) return;
         if (isChoice(el) || el !== document.activeElement) applyToControl(el, value);
       });

@@ -35,6 +35,8 @@ at run time: upgrade both together.
 - Hidden tabs: the runtime closes the connection while the tab is hidden, rejecting the calls in flight and
   without `onDisconnect`, and reopens it when the tab is shown. A page opened in a hidden tab connects when first
   shown. A refused reopening retries with back-off, and each refusal rejects the calls waiting at that moment.
+  Three refused upgrades in a row are final, as a refused first upgrade is: `onConnectError(0)` runs, waiting
+  calls reject with status 0 and later calls at once. A socket that opens resets the count.
 - `destroy()` removes the runtime's `ssr:bind` listeners; after it, `set()` warns and `call()` rejects with
   status 0.
 - Two runtimes with the same route key on one page log a warning.
@@ -49,6 +51,9 @@ at run time: upgrade both together.
   not overwrite a text control that has focus.
 - A refused write leaves an `ssr:bind` control as the user left it when no value was ever received for it;
   before, it was cleared.
+- An `ssr:bind` element inside a block that a live value re-renders, including at the init frame, is wired
+  after each render; before, the new element had no listeners and neither sent nor received values. Each
+  value is applied to the page once, however many runtimes share the connection.
 - The warning on a 1008 close logs the server's reason instead of "slow client".
 - `npm run typecheck` passes: the default type of the writable variables no longer fails with TS2344.
 - Frames that are not objects, init frames without bindings and binding values that are not strings are ignored
