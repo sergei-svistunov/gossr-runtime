@@ -1,10 +1,14 @@
 /**
  * Wire-format types for the GoSSR reactive bindings WebSocket protocol.
- * Mirrors spec section 4 exactly. No runtime logic — types only.
+ * Mirrors spec section 4 exactly.
  *
  * All messages are WebSocket text frames containing a single UTF-8 JSON object.
- * Values are always pre-rendered HTML strings (never typed JSON values).
+ * Binding values are always pre-rendered HTML strings; page call arguments and
+ * results are JSON values.
  */
+
+/** Close code with which the server asks the client to reconnect at once. */
+export const StatusReauth = 4000;
 
 /** Sent by server once after WS connection is accepted. Contains current rendered values. */
 export interface InitFrame {
@@ -84,8 +88,47 @@ export interface ErrFrame {
   code: string;
 }
 
+/** Sent by client to run a page call. Ids count up per connection. */
+export interface CallFrame {
+  t: 'call';
+  id: number;
+  /** 8-hex route path hash of the route that declares the call. */
+  routeKey: string;
+  name: string;
+  args: unknown;
+}
+
+/** Sent by server when a page call returns. */
+export interface ResultFrame {
+  t: 'result';
+  id: number;
+  value: unknown;
+}
+
+/** Sent by server when a page call fails. */
+export interface FailFrame {
+  t: 'fail';
+  id: number;
+  status: number;
+  msg: string;
+}
+
+/**
+ * The error a page call rejects with: the status and message of a fail frame,
+ * or status 0 when the connection was lost before the answer came.
+ */
+export class CallError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'CallError';
+    this.status = status;
+  }
+}
+
 /** Union of all server-to-client frames. */
-export type ServerFrame = InitFrame | PatchFrame | AckFrame | ErrFrame;
+export type ServerFrame = InitFrame | PatchFrame | AckFrame | ErrFrame | ResultFrame | FailFrame;
 
 /** Union of all client-to-server frames. */
-export type ClientFrame = WriteFrame;
+export type ClientFrame = WriteFrame | CallFrame;

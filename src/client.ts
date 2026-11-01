@@ -2,7 +2,8 @@
  * GoSSR reactive-bindings runtime client.
  *
  * Manages WebSocket connections to reactive route /__ws endpoints.
- * Handles the full message lifecycle: init, patch, write, ack, err.
+ * Handles the full message lifecycle: init, patch, write, ack, err, and page
+ * calls (call, result, fail).
  * Implements automatic reconnect with exponential back-off.
  * Wires ssr:bind elements on the page automatically.
  *
@@ -14,24 +15,17 @@
  *
  * Developers never instantiate this class directly. The generated __ssr_gen__.ts
  * calls createSsrClient({ wsUrl, routeKey }) which returns a typed SsrClient instance.
- *
- * SECURITY NOTE on DOM updates:
- * Binding values are GoSSR server-generated pre-rendered HTML strings, produced by the
- * same Go template engine that renders the initial SSR page. This is trusted framework
- * output, not user-supplied content. Updating the DOM with these values is equivalent
- * to server-side rendering hydration. The spec (section 3.3) explicitly specifies that
- * the runtime "sets innerHTML accordingly" for each patch. This design decision is
- * intentional and owned by the GoSSR framework; it is not a user-input XSS vector.
  */
 
-import type { ServerFrame, WriteFrame } from './protocol.js';
-import type { SsrClient } from './types.js';
+import { CallError, StatusReauth } from './protocol.js';
+import type { CallFrame, FailFrame, ResultFrame, ServerFrame, WriteFrame } from './protocol.js';
+import type { Calls, SsrClient } from './types.js';
 
 // ---------------------------------------------------------------------------
 // CSS.escape polyfill for environments that lack it (e.g. old jsdom versions)
-// GoSSR binding keys are variable names (Go identifiers) or lowercase hex hashes,
-// so they only contain [a-zA-Z0-9_] characters and do not actually need escaping.
-// The polyfill is a safety net for future-proofing.
+// GoSSR binding keys are a route key and a local key joined by ".", where the
+// local key is a variable name (Go identifier) or a lowercase hex hash, so they
+// hold [a-zA-Z0-9_.]. Escaping keeps the selector valid for any other key.
 // ---------------------------------------------------------------------------
 
 const cssEscape: (value: string) => string =
@@ -47,6 +41,9 @@ const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 const RECONNECT_JITTER = 0.1; // +-10%
 const RECONNECT_WARN_AFTER = 5; // emit console.warn after this many consecutive failures
+// A 4000 close reconnects at once only after the connection was open this long;
+// sooner, it waits the back-off, so a server that answers 4000 at once cannot loop.
+const REAUTH_MIN_OPEN_MS = 30_000;
 
 // Input types that use the 'input' event (real-time, per-keystroke)
 const INPUT_EVENT_TYPES = new Set([
@@ -63,7 +60,7 @@ type ConnectCallback = () => void;
 type DisconnectCallback = (code: number, reason: string) => void;
 type ConnectErrorCallback = (status: number) => void;
 type ErrorCallback = (varName: string, message: string) => void;
-type BindingCallback = (html: string) => void;
+type BindingCallback = (value: string) => void;
 
 // Handlers registered per SsrRuntime into the shared connection
 interface RuntimeHandlers {
@@ -73,18 +70,61 @@ interface RuntimeHandlers {
   onConnectError(status: number): void;
 }
 
-// ---------------------------------------------------------------------------
-// Trusted HTML setter helper
-//
-// Extracted into a named function so the XSS-linting suppression comment is
-// co-located with the actual DOM write, not scattered across the file.
-// The content here is always server-rendered HTML from the GoSSR template engine.
-// ---------------------------------------------------------------------------
+interface Registration {
+  key: string;
+  handlers: RuntimeHandlers;
+}
 
-function setTrustedHtml(el: Element, html: string): void {
-  // Content is GoSSR server-rendered pre-rendered HTML (spec section 3.3).
-  // This is equivalent to SSR hydration and is intentionally set as element HTML content.
-  el.innerHTML = html; // trusted server-rendered content
+// A page call that has no answer yet. gen is the generation of the socket it
+// was sent on, or 0 while it waits for a socket to open.
+interface PendingCall {
+  gen: number;
+  resolve(value: unknown): void;
+  reject(err: CallError): void;
+}
+
+function connectionLost(): CallError {
+  return new CallError(0, 'The connection was lost.');
+}
+
+// A textarea of an inert document: markup set on it is read as text, entities
+// are decoded, and nothing in it is ever loaded or run.
+let decoder: HTMLTextAreaElement | null = null;
+
+function decodeText(markup: string): string {
+  if (typeof document === 'undefined') return markup;
+  if (!decoder) decoder = document.implementation.createHTMLDocument('').createElement('textarea');
+  decoder.innerHTML = markup;
+  return decoder.value;
+}
+
+type FormControl = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+
+function isChoice(el: Element): el is HTMLInputElement {
+  return el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio');
+}
+
+// Sets a control's state from the decoded text of a value: a checkbox is checked
+// by "true", a radio by its own value (never rewritten), any other control gets
+// the text as its value.
+function applyToControl(el: FormControl, markup: string): void {
+  const text = decodeText(markup);
+  if (!isChoice(el)) {
+    el.value = text;
+    return;
+  }
+  el.checked = el.type === 'checkbox' ? text === 'true' : text === el.value;
+}
+
+// The value is markup the server escaped. A form control gets its decoded text
+// as state (a text control not while it has focus); any other element gets the
+// markup.
+function applyToElement(el: Element, markup: string): void {
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+    if (isChoice(el) || el !== document.activeElement) applyToControl(el, markup);
+    return;
+  }
+  el.innerHTML = markup;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +145,8 @@ function setTrustedHtml(el: Element, html: string): void {
 //   - err with a specific routeKey: dispatched only to the handler registered
 //     for that routeKey.
 //   - ack: dispatched only to the handler registered for that routeKey.
+//   - result/fail: settle the page call with that id, if it was sent on the
+//     socket that delivered the frame; any other is ignored with a warning.
 // ---------------------------------------------------------------------------
 
 class SharedWSConnection {
@@ -113,26 +155,89 @@ class SharedWSConnection {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
   private everOpened = false;
+  // Some socket of this connection has opened.
+  private hasOpened = false;
+  // A refused upgrade waits the back-off instead of going final: set when the
+  // tab is shown again after an open connection, cleared when a socket opens.
+  private retryRefusedUpgrade = false;
+  private openedAt = 0;
+  // Closed by us while the tab is hidden; reopened when it is shown again.
+  private paused = false;
+  // Closed for good: by the server (1000, 1001) or by a refused upgrade.
+  private finished = false;
+  // Counts the sockets of this connection; the current socket has this number.
+  private generation = 0;
 
-  // routeKey -> RuntimeHandlers
-  private readonly handlers = new Map<string, RuntimeHandlers>();
+  private readonly runtimes = new Set<Registration>();
+
+  private nextCallId = 1;
+  private readonly calls = new Map<number, PendingCall>();
+  private readonly waitingCalls: CallFrame[] = [];
+
+  private readonly onVisibilityChange = (): void => {
+    if (document.visibilityState === 'hidden') {
+      this.pause();
+    } else {
+      this.resume();
+    }
+  };
 
   constructor(private readonly wsUrl: string) {
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+      if (document.visibilityState === 'hidden') {
+        // Opened in a hidden tab: connect when it is first shown.
+        this.paused = true;
+        return;
+      }
+    }
     this.connect();
   }
 
-  /** Register a runtime's handlers under its routeKey. */
-  register(routeKey: string, handlers: RuntimeHandlers): void {
-    this.handlers.set(routeKey, handlers);
+  /** Number of runtimes registered on this connection. */
+  runtimeCount(): number {
+    return this.runtimes.size;
+  }
+
+  /** Reports whether the connection is closed because the tab is hidden. */
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Register a runtime's handlers under its routeKey. An empty routeKey (legacy
+   * single-route usage) registers under a stable key.
+   */
+  register(routeKey: string, handlers: RuntimeHandlers): Registration {
+    const key = routeKey || '__legacy__';
+    for (const r of this.runtimes) {
+      if (r.key === key) {
+        console.warn('[gossr] Two runtimes on this page share the route key "' + routeKey + '".');
+        break;
+      }
+    }
+    const registration = { key, handlers };
+    this.runtimes.add(registration);
+    return registration;
   }
 
   /** Unregister a runtime's handlers. If no handlers remain, destroy the connection. */
-  unregister(routeKey: string): void {
-    this.handlers.delete(routeKey);
-    if (this.handlers.size === 0) {
+  unregister(registration: Registration): void {
+    this.runtimes.delete(registration);
+    if (this.runtimes.size === 0) {
       this.destroy();
       sharedConnections.delete(this.wsUrl);
     }
+  }
+
+  private forEachHandlers(fn: (h: RuntimeHandlers) => void): void {
+    this.runtimes.forEach((r) => fn(r.handlers));
+  }
+
+  private forEachHandlersOf(key: string, fn: (h: RuntimeHandlers) => void): void {
+    this.runtimes.forEach((r) => {
+      if (r.key === key) fn(r.handlers);
+    });
   }
 
   /** Send a frame over the shared WS. */
@@ -144,29 +249,106 @@ class SharedWSConnection {
     // This matches fire-and-forget semantics (spec section 3.5).
   }
 
+  /**
+   * Runs a page call. It is sent at once on an open socket, else when the next
+   * socket opens; it rejects at once when the connection is closed for good.
+   */
+  call(routeKey: string, name: string, args: unknown): Promise<unknown> {
+    if (this.destroyed || this.finished) return Promise.reject(connectionLost());
+    const frame: CallFrame = { t: 'call', id: this.nextCallId++, routeKey, name, args: args ?? null };
+    return new Promise((resolve, reject) => {
+      this.calls.set(frame.id, { gen: 0, resolve, reject });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.sendCall(this.ws, this.generation, frame);
+      } else {
+        this.waitingCalls.push(frame);
+      }
+    });
+  }
+
+  // gen is the generation of ws.
+  private sendCall(ws: WebSocket, gen: number, frame: CallFrame): void {
+    const pending = this.calls.get(frame.id);
+    if (!pending) return;
+    ws.send(JSON.stringify(frame));
+    pending.gen = gen;
+  }
+
+  private settleCall(frame: ResultFrame | FailFrame, gen: number): void {
+    const pending = this.calls.get(frame.id);
+    if (!pending || pending.gen !== gen) {
+      console.warn('[gossr] Ignoring a ' + frame.t + ' frame for a call this connection did not send.');
+      return;
+    }
+    this.calls.delete(frame.id);
+    if (frame.t === 'result') {
+      pending.resolve(frame.value);
+    } else {
+      pending.reject(new CallError(frame.status, frame.msg));
+    }
+  }
+
+  // Rejects the calls in flight on a socket that closed; waiting calls stay.
+  private rejectSentCalls(): void {
+    this.calls.forEach((pending, id) => {
+      if (pending.gen === 0) return;
+      this.calls.delete(id);
+      pending.reject(connectionLost());
+    });
+  }
+
+  // Rejects the calls waiting for a socket; calls made later wait for the next one.
+  private rejectWaitingCalls(): void {
+    this.waitingCalls.splice(0).forEach((frame) => {
+      const pending = this.calls.get(frame.id);
+      if (!pending) return;
+      this.calls.delete(frame.id);
+      pending.reject(connectionLost());
+    });
+  }
+
+  private rejectAllCalls(): void {
+    const calls = [...this.calls.values()];
+    this.calls.clear();
+    this.waitingCalls.length = 0;
+    calls.forEach((pending) => pending.reject(connectionLost()));
+  }
+
+  private finish(): void {
+    this.finished = true;
+    this.rejectAllCalls();
+  }
+
   private connect(): void {
     if (this.destroyed) return;
 
+    // A socket abandoned before its close event can no longer answer its calls.
+    if (this.ws) this.rejectSentCalls();
     this.everOpened = false;
+    const gen = ++this.generation;
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
 
     ws.addEventListener('open', () => {
       if (ws !== this.ws) return;
       this.everOpened = true;
-      this.handlers.forEach((h) => h.onConnect());
+      this.hasOpened = true;
+      this.retryRefusedUpgrade = false;
+      this.openedAt = Date.now();
+      this.waitingCalls.splice(0).forEach((frame) => this.sendCall(ws, gen, frame));
+      this.forEachHandlers((h) => h.onConnect());
     });
 
     ws.addEventListener('message', (event: MessageEvent) => {
-      if (ws !== this.ws) return;
-      this.handleMessage(event.data as string);
+      this.handleMessage(event.data as string, gen, ws === this.ws);
     });
 
     ws.addEventListener('error', () => {
-      if (ws !== this.ws) return;
+      if (ws !== this.ws || this.paused || this.retryRefusedUpgrade) return;
       if (!this.everOpened) {
+        this.finish();
         console.error('[gossr] WebSocket upgrade failed for: ' + this.wsUrl);
-        this.handlers.forEach((h) => h.onConnectError(0));
+        this.forEachHandlers((h) => h.onConnectError(0));
         // Do not reconnect: cannot distinguish 4xx from 5xx at the WebSocket API level.
       }
     });
@@ -174,26 +356,66 @@ class SharedWSConnection {
     ws.addEventListener('close', (event: CloseEvent) => {
       if (ws !== this.ws) return;
       this.ws = null;
+      this.rejectSentCalls();
+
+      // Our own 1000 from pause(): not the server's final close.
+      if (this.paused) return;
 
       const { code, reason } = event;
 
       if (!this.everOpened) {
+        if (this.retryRefusedUpgrade) {
+          this.rejectWaitingCalls();
+          this.scheduleReconnect();
+          return;
+        }
         // Upgrade failure: already handled in onerror. Do not reconnect.
+        this.finish();
         return;
       }
 
       if (code === 1000) {
         // Normal closure (page navigated away or explicit destroy). No reconnect.
+        this.finish();
         return;
       }
 
-      if (event.code === 1008) {
-        console.warn('slow client (1008)');
+      if (code === 1008) {
+        console.warn('[gossr] The server closed the connection (1008): ' + reason);
       }
 
-      this.handlers.forEach((h) => h.onDisconnect(code, reason));
+      if (code === 1001) {
+        this.finish();
+        this.forEachHandlers((h) => h.onDisconnect(code, reason));
+        return;
+      }
+
+      this.forEachHandlers((h) => h.onDisconnect(code, reason));
+      if (code === StatusReauth && Date.now() - this.openedAt >= REAUTH_MIN_OPEN_MS) {
+        this.connect();
+        return;
+      }
       this.scheduleReconnect();
     });
+  }
+
+  private pause(): void {
+    if (this.destroyed || this.finished || this.paused) return;
+    this.paused = true;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.ws?.close(1000, 'hidden');
+    this.rejectSentCalls();
+  }
+
+  private resume(): void {
+    if (this.destroyed || this.finished || !this.paused) return;
+    this.paused = false;
+    this.retryCount = 0;
+    this.retryRefusedUpgrade = this.hasOpened;
+    this.connect();
   }
 
   private scheduleReconnect(): void {
@@ -218,34 +440,47 @@ class SharedWSConnection {
     }, delay);
   }
 
-  private handleMessage(raw: string): void {
+  // gen is the generation of the socket that delivered the frame; live reports
+  // whether it is still the current socket.
+  private handleMessage(raw: string, gen: number, live: boolean): void {
     let frame: ServerFrame;
     try {
       frame = JSON.parse(raw) as ServerFrame;
     } catch {
-      console.warn('[gossr] Received unparseable WebSocket message; ignoring.');
+      if (live) console.warn('[gossr] Received unparseable WebSocket message; ignoring.');
+      return;
+    }
+    if (typeof frame !== 'object' || frame === null) {
+      if (live) console.warn('[gossr] Received a frame that is not an object; ignoring.');
       return;
     }
 
+    if (frame.t === 'result' || frame.t === 'fail') {
+      this.settleCall(frame, gen);
+      return;
+    }
+    if (!live) return;
+
     switch (frame.t) {
       case 'init':
+        if (typeof frame.bindings !== 'object' || frame.bindings === null) {
+          console.warn('[gossr] Received init frame without bindings; ignoring.');
+          return;
+        }
         // Reset retry counter when a valid init is received — connection fully established.
         this.retryCount = 0;
         // Broadcast to all registered handlers; each cherry-picks its own bindings.
-        this.handlers.forEach((h) => h.onMessage(frame));
+        this.forEachHandlers((h) => h.onMessage(frame));
         break;
 
       case 'patch':
         // Broadcast to all registered handlers; each cherry-picks relevant binding keys.
-        this.handlers.forEach((h) => h.onMessage(frame));
+        this.forEachHandlers((h) => h.onMessage(frame));
         break;
 
       case 'ack':
         // Route to the handler owning the acknowledged write's routeKey.
-        {
-          const h = this.handlers.get(frame.routeKey);
-          if (h) h.onMessage(frame);
-        }
+        this.forEachHandlersOf(frame.routeKey, (h) => h.onMessage(frame));
         break;
 
       case 'err':
@@ -263,10 +498,7 @@ class SharedWSConnection {
           return;
         }
         // Validation error: route to the owning handler.
-        {
-          const h = this.handlers.get(frame.routeKey);
-          if (h) h.onMessage(frame);
-        }
+        this.forEachHandlersOf(frame.routeKey, (h) => h.onMessage(frame));
         break;
 
       default:
@@ -276,14 +508,17 @@ class SharedWSConnection {
 
   destroy(): void {
     this.destroyed = true;
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    }
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
-    if (this.ws) {
-      this.ws.close(1000, 'destroyed');
-      this.ws = null;
-    }
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close(1000, 'destroyed');
+    this.rejectAllCalls();
   }
 }
 
@@ -314,12 +549,13 @@ function getOrCreateSharedConnection(wsUrl: string): SharedWSConnection {
 
 export class SsrRuntime<
   R extends Record<string, unknown> = Record<string, unknown>,
-  W extends Partial<R> = Record<string, never>
-> implements SsrClient<R, W> {
-  // Last known rendered HTML per binding key (full namespaced key: routeKey.localKey)
+  W extends Partial<R> = Partial<Record<keyof R, never>>,
+  C extends Calls = Record<string, never>
+> implements SsrClient<R, W, C> {
+  // Last known value per binding key (full namespaced key: routeKey.localKey)
   private readonly bindings = new Map<string, string>();
 
-  // Per-key subscribers (full namespaced key or variable name for ssr.on)
+  // Per-key subscribers (full namespaced key)
   private readonly listeners = new Map<string, Set<BindingCallback>>();
 
   // Lifecycle hook registries
@@ -329,33 +565,35 @@ export class SsrRuntime<
   private readonly errorCbs = new Set<ErrorCallback>();
 
   private destroyed = false;
+  // Aborted by destroy() to remove this runtime's DOM listeners.
+  private readonly domListeners = new AbortController();
   private readonly sharedConn: SharedWSConnection;
+  private readonly registration: Registration;
 
   constructor(
     private readonly wsUrl: string,
     private readonly routeKey: string = '',
   ) {
-    // Wire ssr:bind elements after DOM is ready
-    if (typeof document !== 'undefined') {
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => this.wireSsrBindElements());
-      } else {
-        this.wireSsrBindElements();
-      }
-    }
-
     // Get or create the shared connection for this wsUrl
     this.sharedConn = getOrCreateSharedConnection(wsUrl);
 
-    // Register this runtime's handlers under its routeKey.
-    // If routeKey is empty (legacy single-route usage), use a stable key.
-    const registrationKey = routeKey || '__legacy__';
-    this.sharedConn.register(registrationKey, {
+    this.registration = this.sharedConn.register(routeKey, {
       onMessage: (frame) => this.handleFrame(frame),
       onConnect: () => this.fireConnect(),
       onDisconnect: (code, reason) => this.fireDisconnect(code, reason),
       onConnectError: (status) => this.fireConnectError(status),
     });
+
+    // Wire ssr:bind elements after DOM is ready
+    if (typeof document !== 'undefined') {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => this.wireSsrBindElements(), {
+          signal: this.domListeners.signal,
+        });
+      } else {
+        this.wireSsrBindElements();
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -363,10 +601,14 @@ export class SsrRuntime<
   // -------------------------------------------------------------------------
 
   get<K extends keyof R>(name: K): string | undefined {
-    return this.bindings.get(name as string);
+    return this.bindings.get(this.bindingKeyOf(name as string));
   }
 
   set<K extends keyof W>(name: K, value: W[K]): void {
+    if (this.destroyed) {
+      console.warn('[gossr] Ignoring set("' + String(name) + '") on a destroyed runtime.');
+      return;
+    }
     const frame: WriteFrame = {
       t: 'write',
       routeKey: this.routeKey,
@@ -376,8 +618,13 @@ export class SsrRuntime<
     this.sharedConn.sendFrame(frame);
   }
 
-  on<K extends keyof R>(name: K, callback: (html: string) => void): () => void {
-    const key = name as string;
+  call<K extends keyof C & string>(name: K, args: C[K]['in']): Promise<C[K]['out']> {
+    if (this.destroyed) return Promise.reject(connectionLost());
+    return this.sharedConn.call(this.routeKey, name, args) as Promise<C[K]['out']>;
+  }
+
+  on<K extends keyof R>(name: K, callback: (value: string) => void): () => void {
+    const key = this.bindingKeyOf(name as string);
     let set = this.listeners.get(key);
     if (!set) {
       set = new Set();
@@ -410,14 +657,15 @@ export class SsrRuntime<
   }
 
   /**
-   * Permanently close the runtime. Cancels reconnect timers and closes the WS cleanly.
-   * Not part of the SsrClient interface; called by framework teardown.
+   * Permanently close the runtime: removes its ssr:bind listeners and leaves the
+   * shared connection, which closes when no runtime is left on it.
+   * Not part of the SsrClient interface.
    */
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    const registrationKey = this.routeKey || '__legacy__';
-    this.sharedConn.unregister(registrationKey);
+    this.domListeners.abort();
+    this.sharedConn.unregister(this.registration);
   }
 
   // -------------------------------------------------------------------------
@@ -459,15 +707,17 @@ export class SsrRuntime<
     }
   }
 
-  private applyBinding(key: string, html: string): void {
+  private applyBinding(key: string, html: unknown): void {
+    if (typeof html !== 'string') {
+      console.warn('[gossr] Binding "' + key + '" has a value that is not a string; ignoring.');
+      return;
+    }
     this.bindings.set(key, html);
 
     if (typeof document !== 'undefined') {
-      // spec section 3.3: "finds the DOM node(s) bound to that variable via data-ssr-bind
-      // attributes and sets innerHTML accordingly"
       const selector = '[data-ssr-bind="' + cssEscape(key) + '"]';
       document.querySelectorAll(selector).forEach((el) => {
-        setTrustedHtml(el, html);
+        applyToElement(el, html);
       });
     }
 
@@ -481,10 +731,11 @@ export class SsrRuntime<
   }
 
   private handleErr(varName: string, message: string): void {
-    // Reset bound inputs to last accepted value (runtime-states.md State 1)
+    // Reset bound inputs to the last accepted value; with none known, leave them as they are.
     if (typeof document !== 'undefined') {
-      const lastValue = this.bindings.get(varName) ?? '';
-      this.resetBoundElements(varName, lastValue);
+      // The bare key covers a server that sends keys without the route prefix.
+      const lastValue = this.bindings.get(this.bindingKeyOf(varName)) ?? this.bindings.get(varName);
+      if (lastValue !== undefined) this.resetBoundElements(varName, lastValue);
     }
 
     if (this.errorCbs.size > 0) {
@@ -498,11 +749,9 @@ export class SsrRuntime<
   private resetBoundElements(varName: string, value: string): void {
     // Same getAttribute-based iteration as wireSsrBindElements — avoids CSS namespace
     // separator issues with the colon in 'ssr:bind'.
-    document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
-      'input, select, textarea',
-    ).forEach((el) => {
-      if (el.getAttribute('ssr:bind') === varName) {
-        el.value = value;
+    document.querySelectorAll<FormControl>('input, select, textarea').forEach((el) => {
+      if (el.getAttribute('ssr:bind') === varName && this.claimsInput(el)) {
+        applyToControl(el, value);
       }
     });
   }
@@ -510,6 +759,21 @@ export class SsrRuntime<
   // -------------------------------------------------------------------------
   // ssr:bind auto-wiring (spec section 3.5)
   // -------------------------------------------------------------------------
+
+  /** The namespaced binding key under which the server sends this route's variable. */
+  private bindingKeyOf(varName: string): string {
+    return this.routeKey ? this.routeKey + '.' + varName : varName;
+  }
+
+  /**
+   * Reports whether an ssr:bind input belongs to this route: its data-ssr-route
+   * names this route, or it has none and this is the only route on the page.
+   */
+  private claimsInput(el: Element): boolean {
+    const route = el.getAttribute('data-ssr-route');
+    if (route !== null) return route === this.routeKey;
+    return this.sharedConn.runtimeCount() === 1;
+  }
 
   /**
    * Discovers all [ssr:bind] elements and wires them bidirectionally:
@@ -525,9 +789,7 @@ export class SsrRuntime<
     // The colon in the attribute name is a CSS namespace separator, which causes
     // querySelectorAll('[ssr\\:bind]') to return 0 elements in jsdom and may also
     // fail in certain browser CSS parser implementations.
-    document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
-      'input, select, textarea',
-    ).forEach((el) => {
+    document.querySelectorAll<FormControl>('input, select, textarea').forEach((el) => {
       const varName = el.getAttribute('ssr:bind');
       if (!varName) return;
 
@@ -536,14 +798,16 @@ export class SsrRuntime<
 
       // element -> server: fire write frame on user interaction
       el.addEventListener(event, () => {
-        const inputEl = el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
-        this.set(varName as keyof W, inputEl.value as W[keyof W]);
-      });
+        if (!this.claimsInput(el)) return;
+        const value = el instanceof HTMLInputElement && el.type === 'checkbox' ? el.checked : el.value;
+        this.set(varName as keyof W, value as W[keyof W]);
+      }, { signal: this.domListeners.signal });
 
-      // server -> element: update .value when a patch arrives
-      this.on(varName as keyof R, (html: string) => {
-        const inputEl = el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
-        inputEl.value = html;
+      // server -> element: apply a patch for this route's variable, but not to a
+      // text control while it has focus
+      this.on(varName as keyof R, (value: string) => {
+        if (!this.claimsInput(el)) return;
+        if (isChoice(el) || el !== document.activeElement) applyToControl(el, value);
       });
     });
   }
@@ -618,11 +882,12 @@ export interface CreateSsrClientOptions {
  */
 export function createSsrClient<
   R extends Record<string, unknown> = Record<string, unknown>,
-  W extends Partial<R> = Record<string, never>
->(options: CreateSsrClientOptions | string): SsrClient<R, W> {
+  W extends Partial<R> = Partial<Record<keyof R, never>>,
+  C extends Calls = Record<string, never>
+>(options: CreateSsrClientOptions | string): SsrClient<R, W, C> {
   // Accept legacy string argument for backward compatibility during migration.
   if (typeof options === 'string') {
-    return new SsrRuntime<R, W>(options, '');
+    return new SsrRuntime<R, W, C>(options, '');
   }
-  return new SsrRuntime<R, W>(options.wsUrl, options.routeKey);
+  return new SsrRuntime<R, W, C>(options.wsUrl, options.routeKey);
 }

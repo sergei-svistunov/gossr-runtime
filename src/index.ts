@@ -5,13 +5,17 @@
  * a fully-typed 'ssr' object created by calling createSsrClient here.
  */
 
-export type { SsrClient } from './types.js';
+export type { SsrClient, Calls } from './types.js';
+export { StatusReauth, CallError } from './protocol.js';
 export type {
   InitFrame,
   PatchFrame,
   WriteFrame,
   AckFrame,
   ErrFrame,
+  CallFrame,
+  ResultFrame,
+  FailFrame,
   ServerFrame,
   ClientFrame,
 } from './protocol.js';

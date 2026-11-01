@@ -3,17 +3,22 @@
  * This interface matches the design spec in office/design/reactive-bindings/typescript-api.md.
  */
 
+/** The page calls of a route: each call's argument and result types. */
+export type Calls = Record<string, { in: unknown; out: unknown }>;
+
 /**
  * The reactive client object exposed to developers per reactive route.
  *
  * R — full map of readable reactive variables (keys are variable names, values are their TS types).
  * W — subset of R that is client-writable.
+ * C — the route's page calls.
  *
  * Instantiated by the generated __ssr_gen__.ts, not by developers directly.
  */
 export interface SsrClient<
   R extends Record<string, unknown>,
-  W extends Partial<R> = Record<string, never>
+  W extends Partial<R> = Partial<Record<keyof R, never>>,
+  C extends Calls = Record<string, never>
 > {
   /**
    * Returns the last known rendered value for the binding.
@@ -23,6 +28,18 @@ export interface SsrClient<
   get<K extends keyof R>(name: K): string | undefined;
 
   /**
+   * Runs a page call of this route. A call made before the connection opens, or
+   * while it reconnects, waits and is sent once it opens; calls that waited all
+   * go out at once, and the server may refuse those over its in-flight limit
+   * with 429.
+   * Resolves with the call's result; rejects with a CallError carrying the fail
+   * frame's status and message, or status 0 when the connection was lost before
+   * the answer came, a reconnect it waited for was refused, or the connection is
+   * closed for good.
+   */
+  call<K extends keyof C & string>(name: K, args: C[K]['in']): Promise<C[K]['out']>;
+
+  /**
    * Sends a write frame to the server for a client-writable variable.
    * Fire-and-forget: the acknowledged new value arrives via a patch message.
    * TypeScript compile error if called on a variable not in W (the writable subset).
@@ -30,11 +47,11 @@ export interface SsrClient<
   set<K extends keyof W>(name: K, value: W[K]): void;
 
   /**
-   * Subscribes to patch messages for a specific variable.
+   * Subscribes to init and patch messages for a specific variable.
    * The callback receives the new pre-rendered HTML string.
    * Returns an unsubscribe function.
    */
-  on<K extends keyof R>(name: K, callback: (html: string) => void): () => void;
+  on<K extends keyof R>(name: K, callback: (value: string) => void): () => void;
 
   /**
    * Registers a callback that fires when the WebSocket connection is (re-)established.
@@ -44,7 +61,8 @@ export interface SsrClient<
 
   /**
    * Registers a callback that fires when an established connection closes unexpectedly.
-   * Not called when the page navigates away (close code 1000).
+   * Not called for close code 1000, nor when the client pauses the connection
+   * while the tab is hidden.
    * Returns an unsubscribe function.
    */
   onDisconnect(callback: (code: number, reason: string) => void): () => void;

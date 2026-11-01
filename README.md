@@ -1,127 +1,218 @@
 # gossr-runtime
 
-TypeScript runtime for GoSSR reactive bindings.
+TypeScript runtime for GoSSR live values and page calls.
 
 ## What this package does
 
-Manages the client-side WebSocket connection for GoSSR reactive routes. Developers do not import
-this package directly. The GoSSR code generator emits `__ssr_gen__.ts` in each reactive route's
-directory, which imports and instantiates the runtime automatically.
+It runs the browser side of a GoSSR page's live connection: one WebSocket per page that receives the values
+the server renders, sends the values the page writes, and runs the page's calls. It also wires `ssr:bind`
+inputs and reconnects when the connection drops.
+
+Developers do not instantiate it directly. The GoSSR generator emits `__ssr_gen__.ts` next to the template of
+every route with live values or page calls, which creates the typed `ssr` client; page code imports that.
+
+## Versions
+
+go-ssr 0.7.0 needs gossr-runtime 0.2.0, and gossr-runtime 0.2.0 needs go-ssr 0.7.0. Nothing checks the
+pairing at run time: a mismatched pair fails in ways that are hard to read, so upgrade both together.
+
+```bash
+npm install gossr-runtime@^0.2.0
+```
+
+`tsconfig.json` needs `"moduleResolution": "bundler"` or `"nodenext"`, so the package's `exports` map is
+honoured.
 
 ## How the generator wires this in
 
-For a reactive route at `/dashboard`, the generator emits:
+For a route at `/users/_userId_/info` with a live `lastSeen`, a client-writable `displayName` and a
+`refreshLastSeen` call, the generator emits `internal/web/pages/users/_userId_/info/__ssr_gen__.ts`
+(generated, do not edit):
 
-**`internal/web/pages/dashboard/__ssr_gen__.ts`** (generated, do not edit):
 ```typescript
 import { createSsrClient } from 'gossr-runtime';
+import 'gossr-runtime/ssr-block.css';
 
-// R = full map of reactive variables, W = client-writable subset
-export const ssr = createSsrClient<
-  { count: number; threshold: number },
-  { threshold: number }
->('/dashboard/__ws');
-```
-
-**`internal/web/pages/dashboard/index.ts`** (generated import prepended if file exists):
-```typescript
-import { ssr } from './__ssr_gen__';
-// ... rest of developer-written code
-```
-
-The generated `__ssr_gen__.d.ts` provides fully-typed autocomplete for variable names.
-
-## webpack alias setup
-
-Add to your project's `webpack.config.js`:
-```javascript
-resolve: {
-  alias: {
-    'gossr-runtime': path.resolve(__dirname, 'path/to/go-ssr/pkg/runtime-ts/dist/index.js'),
-  },
+export interface LastSeenOut {
+  lastSeen: string;
+  at: string;
 }
+
+export type ReadVars = {
+  displayName: string;
+  lastSeen: string;
+}
+
+export type WriteVars = {
+  displayName: string;
+}
+
+export type Calls = {
+  refreshLastSeen: { in: Record<string, never>; out: LastSeenOut };
+}
+
+export const ssr = createSsrClient<ReadVars, WriteVars, Calls>({
+  wsUrl: typeof window !== 'undefined'
+    ? window.location.pathname.replace(/\/$/, '') + '/__ws' + window.location.search
+    : '',
+  routeKey: '2b2f214e',
+});
 ```
 
-Or when used via `go install`, configure `webpack.config.js` to resolve from the module cache.
+- `ReadVars` lists the route's reactive variables. Each is a `string`: the markup the server rendered.
+- `WriteVars` lists the client-writable variables with their types.
+- `Calls` lists the route's page calls with their argument and result types.
+- `wsUrl` is the page's path followed by `/__ws`, with the page's query string; `routeKey` identifies the
+  route on the connection.
 
-## Protocol (spec section 4)
+`gossr-assets-webpack-plugin` bundles `__ssr_gen__.ts` into the route's chunk, so the connection opens on
+every such page whether or not the route has an `index.ts`. `ssr-block.css` makes the wrapper elements the
+server renders around live values (`<ssr-block>`) take no part in layout.
 
-All messages are WebSocket text frames containing a single JSON object.
-
-| Frame | Direction | Shape |
-|-------|-----------|-------|
-| `init` | server -> client | `{ t: "init", bindings: { key: "html" } }` |
-| `patch` | server -> client | `{ t: "patch", key: "varName", html: "..." }` |
-| `write` | client -> server | `{ t: "write", var: "varName", value: "..." }` |
-| `ack` | server -> client | `{ t: "ack", var: "varName" }` |
-| `err` | server -> client | `{ t: "err", var: "varName", msg: "..." }` |
-
-Values are always pre-rendered HTML strings (never typed JSON values). The server renders them
-using the same Go template engine that produces the initial SSR page.
-
-## Developer API (`SsrClient<R, W>`)
+## API
 
 ```typescript
-// Imported from the generated file, not from gossr-runtime directly:
+import { CallError } from 'gossr-runtime';
 import { ssr } from './__ssr_gen__';
 
-// Read last known rendered HTML for a variable
-const html: string | undefined = ssr.get('count');
+// The last markup received for the variable, or undefined
+const html: string | undefined = ssr.get('lastSeen');
 
-// Send a write to the server (fire-and-forget; ack arrives as a patch)
-ssr.set('threshold', 50);
+// Runs on the init and on every patch of the variable; returns an unsubscribe function
+const unsub = ssr.on('lastSeen', (markup) => { /* side effects */ });
+unsub();
 
-// Subscribe to server pushes for a variable; returns unsubscribe function
-const unsub = ssr.on('count', (html) => { /* update custom UI */ });
-unsub(); // clean up
+// Writes a client-writable variable; fire and forget
+ssr.set('displayName', 'Ada');
 
-// Lifecycle hooks
-ssr.onConnect(() => { /* WS connected or reconnected */ });
-ssr.onDisconnect((code, reason) => { /* WS closed unexpectedly */ });
-ssr.onConnectError((status) => { /* WS upgrade rejected; status may be 0 */ });
-ssr.onError((varName, message) => { /* server validation rejected a write */ });
+// Runs a page call and awaits its result
+ssr.call('refreshLastSeen', {})
+  .then((out) => { /* out: LastSeenOut */ })
+  .catch((err) => {
+    if (err instanceof CallError) { /* err.status, err.message */ }
+  });
+
+// Lifecycle hooks; each returns an unsubscribe function
+ssr.onConnect(() => { /* connected or reconnected */ });
+ssr.onDisconnect((code, reason) => { /* an open connection closed unexpectedly */ });
+ssr.onConnectError((status) => { /* the upgrade was refused; status is 0 */ });
+ssr.onError((varName, message) => { /* the server refused a write */ });
 ```
 
-## Reconnect behavior
+- `get` and `on` take a bare variable name and give the string as received: escaped **markup**, not decoded
+  text. They read the variable's plain `{{ name }}` site; a variable without one has nothing to read. Never
+  write the string into `innerHTML` unless you mean it as markup.
+- `set` sends any JSON value. The accepted value comes back as a patch; a write made while the connection is
+  down is dropped. A refused write calls `onError`, or logs a warning when no handler is registered.
+- `onConnectError` always receives 0: browsers do not expose the status of a refused upgrade.
 
-On unexpected WS close (any code other than `1000`), the runtime reconnects automatically using
-exponential back-off:
-- Initial delay: 1 s
-- Maximum delay: 30 s
-- Jitter: +-10%
+The package also exports `CallError`, `StatusReauth` (4000), the `SsrClient` and `Calls` types, the frame
+types (`InitFrame`, `PatchFrame`, `WriteFrame`, `AckFrame`, `ErrFrame`, `CallFrame`, `ResultFrame`,
+`FailFrame`, `ServerFrame`, `ClientFrame`), `createSsrClient` and `SsrRuntime`. `SsrRuntime.destroy()` removes
+the runtime's `ssr:bind` listeners and leaves the shared connection, which closes when no runtime is left on
+it; after it, `set` warns and `call` rejects with status 0.
 
-After reconnect, the server sends a fresh `init` snapshot so the DOM reflects current server state
-without a page reload.
+## Live values in the DOM
 
-## Upgrade failure behavior
+The server escapes every live value with the same escapers as the first render and sends one markup string per
+binding key. The runtime applies it to every element whose `data-ssr-bind` names that key:
 
-If the WS upgrade is rejected (HTTP non-101 response), the runtime:
-1. Does NOT reconnect (retrying a `401` would be pointless without re-authentication).
-2. Fires `onConnectError(0)` — the browser WebSocket API does not expose the HTTP status code for
-   rejected upgrades; developers who need the status should check their auth state via a separate
-   fetch call.
-3. Logs `console.error('[gossr] WebSocket upgrade failed for: <url>')`.
+- an element that is not a form control gets the string as its `innerHTML`;
+- a form control (`input`, `textarea`, `select`) gets the entity-decoded text, decoded in an inert document
+  where nothing loads or runs, as its value. A checkbox is checked by the text `true`; a radio button is
+  checked when the text equals its own value, which is never rewritten;
+- a text control that has focus is not overwritten while the user types; a checkbox or radio button is set
+  whether or not it has focus.
 
-## DOM update security note
+## ssr:bind
 
-Binding values received in `init` and `patch` frames are server-generated pre-rendered HTML strings
-produced by the GoSSR template engine — the same engine that renders the initial SSR page. They
-are set as element content using the DOM API. This is equivalent to SSR hydration and is intentional
-framework behavior per spec section 3.3. These values are not user-supplied input.
+The runtime wires every `input`, `select` and `textarea` with an `ssr:bind="name"` attribute whose
+`data-ssr-route` names its route:
 
-## Running tests
+- text-like inputs and `textarea` send their value on `input`; `select`, checkboxes and radio buttons on
+  `change`. A checkbox sends its checked state as a JSON boolean, any other control its value as a string;
+- the element receives the value the server sends for the variable's plain `{{ name }}` site, as above: a
+  focused text control is skipped, a focused checkbox or radio button is set. A page without such a site
+  sends no echo;
+- when the server refuses a write, bound elements go back to the last value it sent for that site. When it
+  has sent none, they keep what the user entered.
 
+When a page has one route, an `ssr:bind` element without `data-ssr-route` belongs to it.
+
+## Page calls
+
+`ssr.call(name, args)` sends a call frame with a fresh id and resolves with the call's result, or rejects with
+a `CallError`:
+
+- a status the server sent (400, 401, 403, 404, 429, 500, 504, …) comes with the server's message, which is
+  meant for the page;
+- status 0, `The connection was lost.`, means the answer did not arrive: the socket closed first, or the
+  connection is closed for good. The call may still have run on the server.
+
+The runtime never retries a call. A call made before the connection opens, or while it is reconnecting or the
+tab is hidden, waits; every waiting call is sent at once when the next socket opens, and the server answers
+those over its limit of 4 at a time with 429. Calls already sent on a socket that closes reject with status 0,
+including when the tab is hidden. After the tab is shown again, each refused reconnect rejects the calls
+waiting at that moment.
+
+Call ids count up for the page across reconnects. An answer to a call that was not sent on the socket that
+delivered it is ignored with a warning.
+
+## Connection lifecycle
+
+| Event | What the runtime does |
+|---|---|
+| close 1000 | final; no `onDisconnect` |
+| close 1001 | final; `onDisconnect` |
+| close 4000 | `onDisconnect`; reconnects at once if the connection was open at least 30 seconds, else with back-off |
+| close 1008 | logs a warning with the server's reason, `onDisconnect`, reconnects with back-off |
+| any other close (1006, 1011, …) | `onDisconnect`, reconnects with back-off |
+| tab hidden | closes the socket itself, without `onDisconnect`, and rejects the calls in flight |
+| tab shown | reopens the connection; a refused upgrade then retries with back-off |
+| upgrade refused | final, unless it is a reopening after the tab was shown: `onConnectError(0)`, every waiting call rejects |
+
+The server closes every connection after 10 minutes with 4000, and the reconnect passes its checks again. It
+closes with 1008 when a `Subscribe` refuses the session, when a route guard refuses a call (after that call's
+fail frame), or when the client is too slow to read; the reconnect that follows passes the guards again or is
+refused.
+
+Back-off starts at 1 second and doubles up to 30 seconds, with ±10% jitter; after 5 failed attempts in a row
+each further one logs a warning. A valid init frame resets it.
+
+A page opened in a hidden tab connects when the tab is first shown, and a refused upgrade then is final.
+
+A refused upgrade — the first one, or one after a drop — usually means the session has ended or the page's
+guards now refuse it. Reload the page in `onConnectError`, so the server can send the user to sign in:
+
+```typescript
+ssr.onConnectError(() => location.reload());
 ```
-cd pkg/runtime-ts
+
+## Frames
+
+The frames are an internal contract between this package and the go-ssr version it pairs with; go-ssr's
+`docs/fe-be-contract.md` describes them. Every frame is a WebSocket text frame holding one JSON object with a
+type field `t`: `init`, `patch`, `ack`, `err`, `result` and `fail` from the server; `write` and `call` from the
+client. Binding values are markup strings; call arguments and results are JSON values. The runtime ignores
+frames it cannot parse or does not know, with a warning.
+
+## Security
+
+Binding values in `init` and `patch` frames are markup the GoSSR server rendered with the same context escapers
+as the page, so a value a user typed arrives escaped. The runtime puts that markup into `innerHTML` only for a
+`data-ssr-bind` element that is not a form control; form controls get decoded text, never markup. A `{{$ }}`
+site in a template is markup its author vouches for, on the first render and live alike.
+
+`get()` and `on()` hand your code the same markup. Treat it as markup: put it into `innerHTML` only when you
+mean to render it, and decode it before using it as text.
+
+## Development
+
+```bash
 npm install
+npm run typecheck
 npm test
-```
-
-## Building
-
-```
 npm run build
 ```
 
-Output goes to `dist/`. The build target is ES2017 (supports `async/await` natively; no need for
-async/await downleveling). Browser compatibility: all modern browsers. IE11 is not supported.
+`npm run build` writes `dist/`. The build target is ES2017, for all modern browsers.

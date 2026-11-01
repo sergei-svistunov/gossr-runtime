@@ -1,50 +1,32 @@
-/**
- * Behavioral tests for SsrRuntime (client.ts).
- *
- * Covers the required test scenarios from the frontend plan:
- * 1. init frame populates [data-ssr-bind] elements
- * 2. patch frame updates only the targeted span
- * 3. input[ssr:bind] input event fires write frame; ack silently consumed; err fires hook + resets
- * 4. select[ssr:bind] change event fires write frame
- * 5. textarea[ssr:bind] fires write frame
- * 6. Reconnect: unexpected close reconnects with back-off, new init applies
- * 7. Upgrade failure: onerror before onopen fires onConnectError once, no retry
- * 8. Close code 1000: no reconnect
- * 9. Close code 1008: reconnect starts AND slow-client console.warn is emitted
- * 10. ssr.get returns last known HTML string
- * 11. ssr.on fires on patch; unsubscribe removes it
- * 12. After 5 failed reconnects, console.warn with count is emitted
- * NEW (Round 4):
- * 13. Two reactive routes share one WS connection (multiplexing)
- * 14. Parent init + child init combined in one frame; both apply their own bindings
- * 15. ssr.set from child includes child's routeKey
- * 16. err{code:"unknown_route",routeKey:""} logs console.warn and does NOT invoke onError
- * NEW (Round 5):
- * 17. ssr.set sends numeric value as number (not string)
- * 18. ssr.set sends boolean value as boolean (not string)
- * 19. ssr.set sends object value as object literal (not stringified)
- * 20. err{code:"decode_error"} logs console.warn and does NOT invoke onError
- */
+// Behavioural tests for SsrRuntime and its shared live connection.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SsrRuntime, getSharedConnectionRegistry } from '../src/client.js';
+import { StatusReauth } from '../src/protocol.js';
 import { installMockWebSocket, latestMockWs, mockWsInstances } from './mock-websocket.js';
 
 let teardown: () => void;
+
+function clearRegistry(): void {
+  getSharedConnectionRegistry().forEach((conn) => conn.destroy());
+  getSharedConnectionRegistry().clear();
+}
 
 beforeEach(() => {
   teardown = installMockWebSocket();
   document.body.innerHTML = '';
   // Clear shared connection registry between tests to prevent cross-test pollution.
-  getSharedConnectionRegistry().clear();
+  clearRegistry();
 });
 
 afterEach(() => {
+  // Destroy leftover connections so they stop watching the tab.
+  clearRegistry();
+  Reflect.deleteProperty(document, 'visibilityState');
+  Reflect.deleteProperty(document, 'hidden');
   teardown();
   vi.restoreAllMocks();
   vi.useRealTimers();
-  // Ensure registry is cleared after each test.
-  getSharedConnectionRegistry().clear();
 });
 
 // Helper: create a runtime and immediately open the WS connection
@@ -62,6 +44,11 @@ function sendInit(bindings: Record<string, string>, routeKey = ''): void {
 // Helper: send a patch frame (with routeKey field)
 function sendPatch(key: string, html: string, routeKey = ''): void {
   latestMockWs().serverSend(JSON.stringify({ t: 'patch', routeKey, key, html }));
+}
+
+function setVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+  document.dispatchEvent(new Event('visibilitychange'));
 }
 
 // ---------------------------------------------------------------------------
@@ -98,11 +85,28 @@ describe('init frame', () => {
     rt.destroy();
   });
 
+  it('populates a span with escaped markup as text', () => {
+    document.body.innerHTML = '<span data-ssr-bind="label"></span>';
+    const rt = makeRuntime();
+    sendInit({ label: '&lt;strong&gt;hello&lt;/strong&gt;' });
+    const span = document.querySelector('[data-ssr-bind="label"]')!;
+    expect(span.textContent).toBe('<strong>hello</strong>');
+    expect(span.querySelector('strong')).toBeNull();
+    rt.destroy();
+  });
+
   it('updates ssr.get() for all keys in the init frame', () => {
     const rt = makeRuntime();
     sendInit({ x: 'foo', y: 'bar' });
     expect(rt.get('x')).toBe('foo');
     expect(rt.get('y')).toBe('bar');
+    rt.destroy();
+  });
+
+  it('updates ssr.get() with the string as received', () => {
+    const rt = makeRuntime();
+    sendInit({ x: '&lt;b&gt;foo&lt;/b&gt;' });
+    expect(rt.get('x')).toBe('&lt;b&gt;foo&lt;/b&gt;');
     rt.destroy();
   });
 
@@ -113,6 +117,15 @@ describe('init frame', () => {
     sendInit({ x: 'hello', y: 'world' });
     expect(xCb).toHaveBeenCalledOnce();
     expect(xCb).toHaveBeenCalledWith('hello');
+    rt.destroy();
+  });
+
+  it('fires ssr.on() listeners with the string as received', () => {
+    const rt = makeRuntime();
+    const xCb = vi.fn();
+    rt.on('x', xCb);
+    sendInit({ x: '&lt;hello&gt;' });
+    expect(xCb).toHaveBeenCalledWith('&lt;hello&gt;');
     rt.destroy();
   });
 });
@@ -129,6 +142,17 @@ describe('patch frame', () => {
     sendInit({ a: 'old-a', b: 'old-b' });
     sendPatch('a', 'new-a');
     expect(document.querySelector('[data-ssr-bind="a"]')!.innerHTML).toBe('new-a');
+    expect(document.querySelector('[data-ssr-bind="b"]')!.innerHTML).toBe('old-b');
+    rt.destroy();
+  });
+
+  it('updates only the span for the patched key with escaped markup', () => {
+    document.body.innerHTML =
+      '<span data-ssr-bind="a">old-a</span><span data-ssr-bind="b">old-b</span>';
+    const rt = makeRuntime();
+    sendPatch('a', '&lt;i&gt;new-a&lt;/i&gt;');
+    expect(document.querySelector('[data-ssr-bind="a"]')!.textContent).toBe('<i>new-a</i>');
+    expect(document.querySelector('[data-ssr-bind="a"] i')).toBeNull();
     expect(document.querySelector('[data-ssr-bind="b"]')!.innerHTML).toBe('old-b');
     rt.destroy();
   });
@@ -222,6 +246,20 @@ describe('input ssr:bind', () => {
     rt.destroy();
   });
 
+  it('a refused write leaves an input alone when no value was received for it', () => {
+    document.body.innerHTML = '<input ssr:bind="counter" type="number" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    sendInit({}, '3f7a');
+    const input = document.querySelector<HTMLInputElement>('input')!;
+    input.value = '-1';
+    rt.onError(() => {});
+    latestMockWs().serverSend(JSON.stringify({
+      t: 'err', routeKey: '3f7a', var: 'counter', msg: 'negative', code: 'validation_failed',
+    }));
+    expect(input.value).toBe('-1');
+    rt.destroy();
+  });
+
   it('default onError behavior logs to console.warn', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const rt = makeRuntime('ws://localhost/__ws', '3f7a');
@@ -259,6 +297,84 @@ describe('select ssr:bind', () => {
     const select = document.querySelector<HTMLSelectElement>('select')!;
     select.dispatchEvent(new Event('input')); // wrong event for select
     expect(latestMockWs().sentMessages).toHaveLength(0);
+    rt.destroy();
+  });
+});
+
+describe('checkbox and radio ssr:bind', () => {
+  it('a checkbox sends its checked state as a boolean', () => {
+    document.body.innerHTML = '<input ssr:bind="done" type="checkbox" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const box = document.querySelector<HTMLInputElement>('input')!;
+    box.checked = true;
+    box.dispatchEvent(new Event('change'));
+    box.checked = false;
+    box.dispatchEvent(new Event('change'));
+    expect(latestMockWs().sentMessages.map((m) => JSON.parse(m))).toEqual([
+      { t: 'write', routeKey: '3f7a', var: 'done', value: true },
+      { t: 'write', routeKey: '3f7a', var: 'done', value: false },
+    ]);
+    rt.destroy();
+  });
+
+  it('a radio sends its value', () => {
+    document.body.innerHTML = '<input ssr:bind="mode" type="radio" value="fast" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const radio = document.querySelector<HTMLInputElement>('input')!;
+    radio.checked = true;
+    radio.dispatchEvent(new Event('change'));
+    expect(JSON.parse(latestMockWs().sentMessages[0])).toEqual({ t: 'write', routeKey: '3f7a', var: 'mode', value: 'fast' });
+    rt.destroy();
+  });
+
+  const radioGroup =
+    '<input ssr:bind="mode" type="radio" name="m" value="fast" />' +
+    '<input ssr:bind="mode" type="radio" name="m" value="slow" />';
+
+  function radios(): { value: string; checked: boolean }[] {
+    return Array.from(document.querySelectorAll<HTMLInputElement>('input')).map((r) => ({ value: r.value, checked: r.checked }));
+  }
+
+  function refuse(name: string): void {
+    latestMockWs().serverSend(JSON.stringify({ t: 'err', routeKey: '3f7a', var: name, msg: 'no', code: 'validation_failed' }));
+  }
+
+  it('a patch checks the matching radio and keeps every radio value', () => {
+    document.body.innerHTML = radioGroup;
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    sendPatch('3f7a.mode', 'slow', '3f7a');
+    expect(radios()).toEqual([{ value: 'fast', checked: false }, { value: 'slow', checked: true }]);
+    sendPatch('3f7a.mode', 'fast', '3f7a');
+    expect(radios()).toEqual([{ value: 'fast', checked: true }, { value: 'slow', checked: false }]);
+    rt.destroy();
+  });
+
+  it('a patch unticks and ticks a checkbox', () => {
+    document.body.innerHTML = '<input ssr:bind="done" type="checkbox" checked />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const box = document.querySelector<HTMLInputElement>('input')!;
+    sendPatch('3f7a.done', 'false', '3f7a');
+    expect(box.checked).toBe(false);
+    sendPatch('3f7a.done', 'true', '3f7a');
+    expect(box.checked).toBe(true);
+    expect(box.value).toBe('on');
+    rt.destroy();
+  });
+
+  it('a refused write restores the radio and checkbox state by checked', () => {
+    document.body.innerHTML = radioGroup + '<input ssr:bind="done" type="checkbox" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    rt.onError(() => {});
+    sendInit({ '3f7a.mode': 'fast', '3f7a.done': 'true' }, '3f7a');
+    const [fast, slow, box] = Array.from(document.querySelectorAll<HTMLInputElement>('input'));
+    slow.checked = true;
+    box.checked = false;
+    refuse('mode');
+    refuse('done');
+    expect([fast.checked, slow.checked]).toEqual([true, false]);
+    expect([fast.value, slow.value]).toEqual(['fast', 'slow']);
+    expect(box.checked).toBe(true);
+    expect(box.value).toBe('on');
     rt.destroy();
   });
 });
@@ -392,6 +508,9 @@ describe('upgrade failure', () => {
     ws.serverClose(1006, 'upgrade failed');
     vi.advanceTimersByTime(10_000);
     expect(mockWsInstances).toHaveLength(1);
+    setVisibility('hidden');
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(1);
     rt.destroy();
   });
 
@@ -415,19 +534,18 @@ describe('upgrade failure', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 9: Unexpected close — reconnect path; 1008 slow-client warn restored
+// Test 9: Unexpected close — reconnect path; a 1008 close logs its reason
 //
-// Backend migrated to github.com/coder/websocket which CAN send close code 1008
-// for slow-client disconnects. The client reinstates the 1008 detection branch.
+// The server closes with 1008 for a slow client and for a refused page call.
 // ---------------------------------------------------------------------------
 
-describe('slow client disconnect (1008)', () => {
-  it('logs console.warn with slow client message when WS closes with code 1008', () => {
+describe('policy close (1008)', () => {
+  it.each(['slow client', 'This page is not allowed.'])('logs the close reason: %s', (reason) => {
     vi.useFakeTimers();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const rt = makeRuntime();
-    latestMockWs().serverClose(1008, 'slow client');
-    expect(warnSpy).toHaveBeenCalledWith('slow client (1008)');
+    latestMockWs().serverClose(1008, reason);
+    expect(warnSpy).toHaveBeenCalledWith('[gossr] The server closed the connection (1008): ' + reason);
     rt.destroy();
   });
 
@@ -440,14 +558,14 @@ describe('slow client disconnect (1008)', () => {
     rt.destroy();
   });
 
-  it('does not emit slow-client warn for non-1008 unexpected closes (1006, 1011)', () => {
+  it('does not emit the 1008 warn for other unexpected closes (1006, 1011)', () => {
     vi.useFakeTimers();
 
     // code 1006 (abnormal closure)
     const warnSpy1006 = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const rt1 = makeRuntime();
     latestMockWs().serverClose(1006, 'abnormal');
-    expect(warnSpy1006).not.toHaveBeenCalledWith('slow client (1008)');
+    expect(warnSpy1006).not.toHaveBeenCalledWith(expect.stringContaining('(1008)'));
     rt1.destroy();
     warnSpy1006.mockRestore();
 
@@ -456,7 +574,7 @@ describe('slow client disconnect (1008)', () => {
     const warnSpy1011 = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const rt2 = makeRuntime();
     latestMockWs().serverClose(1011, 'internal error');
-    expect(warnSpy1011).not.toHaveBeenCalledWith('slow client (1008)');
+    expect(warnSpy1011).not.toHaveBeenCalledWith(expect.stringContaining('(1008)'));
     rt2.destroy();
     warnSpy1011.mockRestore();
   });
@@ -481,6 +599,13 @@ describe('ssr.get', () => {
     expect(rt.get('x')).toBe('second');
     rt.destroy();
   });
+
+  it('returns a patch value as received', () => {
+    const rt = makeRuntime();
+    sendPatch('x', '&amp;third');
+    expect(rt.get('x')).toBe('&amp;third');
+    rt.destroy();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -496,6 +621,15 @@ describe('ssr.on', () => {
     sendPatch('counter', 'updated');
     expect(cb).toHaveBeenCalledTimes(2); // once for init, once for patch
     expect(cb).toHaveBeenLastCalledWith('updated');
+    rt.destroy();
+  });
+
+  it('callback receives a patch value as received', () => {
+    const rt = makeRuntime();
+    const cb = vi.fn();
+    rt.on('counter', cb);
+    sendPatch('counter', '&quot;7&quot;');
+    expect(cb).toHaveBeenCalledWith('&quot;7&quot;');
     rt.destroy();
   });
 
@@ -646,6 +780,29 @@ describe('malformed messages', () => {
     rt.destroy();
   });
 
+  it('ignores an init frame whose bindings are not an object', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rt = makeRuntime();
+    expect(() => {
+      latestMockWs().serverSend(JSON.stringify({ t: 'init', routeKey: '', bindings: null }));
+      latestMockWs().serverSend(JSON.stringify({ t: 'init', routeKey: '' }));
+      latestMockWs().serverSend(JSON.stringify({ t: 'init', routeKey: '', bindings: 'x' }));
+    }).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(3);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('init frame without bindings'));
+    expect(rt.get('0')).toBeUndefined();
+    rt.destroy();
+  });
+
+  it.each(['null', '5', '"x"'])('ignores a frame that is not an object: %s', (raw) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rt = makeRuntime();
+    expect(() => latestMockWs().serverSend(raw)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy).toHaveBeenCalledWith('[gossr] Received a frame that is not an object; ignoring.');
+    rt.destroy();
+  });
+
   it('ignores unknown frame type without throwing', () => {
     const rt = makeRuntime();
     expect(() => {
@@ -718,9 +875,9 @@ describe('WS multiplexing — two reactive routes share one connection', () => {
     expect(document.querySelector('[data-ssr-bind="3f7a.count"]')!.innerHTML).toBe('5');
     expect(document.querySelector('[data-ssr-bind="9d1e.count"]')!.innerHTML).toBe('7');
 
-    // Both runtimes must have the values in their internal bindings map
-    expect(parentRt.get('3f7a.count')).toBe('5');
-    expect(childRt.get('9d1e.count')).toBe('7');
+    // Each runtime reads its own route's value by the variable's name
+    expect(parentRt.get('count')).toBe('5');
+    expect(childRt.get('count')).toBe('7');
 
     parentRt.destroy();
     childRt.destroy();
@@ -1002,6 +1159,636 @@ describe('TestErr_DecodeError', () => {
     }));
 
     expect(errorCb).toHaveBeenCalledOnce();
+    rt.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Applying values
+// ---------------------------------------------------------------------------
+
+describe('applying values', () => {
+  it('escaped value shows as text', () => {
+    document.body.innerHTML = '<span data-ssr-bind="x"></span>';
+    const rt = makeRuntime();
+    sendInit({ x: '&lt;img src=x onerror=alert(1)&gt;' });
+    sendPatch('x', '&lt;img src=x onerror=alert(1)&gt;');
+    expect(document.querySelector('img')).toBeNull();
+    expect(document.querySelector('[data-ssr-bind="x"]')!.textContent).toBe('<img src=x onerror=alert(1)>');
+    rt.destroy();
+  });
+
+  it('markup sets innerHTML', () => {
+    document.body.innerHTML = '<span data-ssr-bind="x"></span>';
+    const rt = makeRuntime();
+    sendPatch('x', '<em>hi</em>');
+    expect(document.querySelector('[data-ssr-bind="x"] em')!.textContent).toBe('hi');
+    rt.destroy();
+  });
+
+  it('input gets the decoded text', () => {
+    const value = '&lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;';
+    const decoded = '<b>x</b> & "y"';
+    document.body.innerHTML = '<input type="text" data-ssr-bind="v"><input type="text" ssr:bind="v">';
+    const inputs = document.querySelectorAll<HTMLInputElement>('input');
+    const rt = makeRuntime();
+    const cb = vi.fn();
+    rt.on('v', cb);
+    sendPatch('v', value);
+    expect(inputs[0].value).toBe(decoded);
+    expect(inputs[1].value).toBe(decoded);
+    expect(rt.get('v')).toBe(value);
+    expect(cb).toHaveBeenCalledWith(value);
+    rt.destroy();
+  });
+
+  it('an err reset writes the decoded text into the input', () => {
+    document.body.innerHTML = '<input ssr:bind="v" type="text" />';
+    const input = document.querySelector('input')!;
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    rt.onError(() => {});
+    sendInit({ v: '&lt;b&gt; &amp;' });
+    input.value = 'typed';
+    latestMockWs().serverSend(JSON.stringify({
+      t: 'err', routeKey: '3f7a', var: 'v', msg: 'bad', code: 'validation_failed',
+    }));
+    expect(input.value).toBe('<b> &');
+    rt.destroy();
+  });
+
+  it('decoding runs no markup', () => {
+    const onMutation = vi.fn();
+    const hit = vi.fn();
+    (window as unknown as { hit: () => void }).hit = hit;
+    document.body.innerHTML = '<input type="text" data-ssr-bind="v">';
+    const input = document.querySelector('input')!;
+    const rt = makeRuntime();
+    const observer = new MutationObserver(onMutation);
+    observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    const count = document.getElementsByTagName('*').length;
+
+    sendPatch('v', '&lt;img src=x onerror=hit()&gt;');
+    sendPatch('v', '</textarea><img src=x onerror=hit()>');
+
+    expect(input.value).toBe('</textarea><img src=x onerror=hit()>');
+    expect(document.getElementsByTagName('*').length).toBe(count);
+    expect(observer.takeRecords()).toHaveLength(0);
+    observer.disconnect();
+    expect(onMutation).not.toHaveBeenCalled();
+    expect(hit).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
+  it('a checkbox gets checked from the decoded text', () => {
+    document.body.innerHTML = '<input type="checkbox" data-ssr-bind="on">';
+    const box = document.querySelector<HTMLInputElement>('input')!;
+    const rt = makeRuntime();
+    sendPatch('on', 'true');
+    expect(box.checked).toBe(true);
+    sendPatch('on', 'false');
+    expect(box.checked).toBe(false);
+    rt.destroy();
+  });
+
+  it('a radio is checked when the decoded text matches its value', () => {
+    document.body.innerHTML =
+      '<input type="radio" name="c" value="a&b" data-ssr-bind="c">' +
+      '<input type="radio" name="c" value="b" data-ssr-bind="c" checked>';
+    const inputs = document.querySelectorAll<HTMLInputElement>('input');
+    const rt = makeRuntime();
+    sendPatch('c', 'a&amp;b');
+    expect(inputs[0].checked).toBe(true);
+    expect(inputs[1].checked).toBe(false);
+    rt.destroy();
+  });
+
+  it('a text input, textarea and select get the value', () => {
+    document.body.innerHTML =
+      '<input type="text" data-ssr-bind="v"><textarea data-ssr-bind="v"></textarea>' +
+      '<select data-ssr-bind="v"><option value="a">a</option><option value="b">b</option></select>';
+    const rt = makeRuntime();
+    sendPatch('v', 'b');
+    expect(document.querySelector('input')!.value).toBe('b');
+    expect(document.querySelector('textarea')!.value).toBe('b');
+    expect(document.querySelector('select')!.value).toBe('b');
+    rt.destroy();
+  });
+
+  it('a focused text input keeps its value', () => {
+    document.body.innerHTML = '<input type="text" data-ssr-bind="q"><input type="text" data-ssr-bind="q">';
+    const inputs = document.querySelectorAll<HTMLInputElement>('input');
+    const focused = inputs[0];
+    const other = inputs[1];
+    focused.value = 'typing';
+    focused.focus();
+    const rt = makeRuntime();
+    sendPatch('q', 'server');
+    expect(focused.value).toBe('typing');
+    expect(other.value).toBe('server');
+    rt.destroy();
+  });
+
+  it('a value that is not a string is ignored', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    document.body.innerHTML = '<span data-ssr-bind="x">old</span>';
+    const rt = makeRuntime();
+    const cb = vi.fn();
+    rt.on('x', cb);
+    latestMockWs().serverSend(JSON.stringify({ t: 'init', routeKey: '', bindings: { x: { html: '<b>' } } }));
+    latestMockWs().serverSend(JSON.stringify({ t: 'patch', routeKey: '', key: 'x' }));
+    latestMockWs().serverSend(JSON.stringify({ t: 'patch', routeKey: '', key: 'x', html: 1 }));
+    expect(document.querySelector('[data-ssr-bind="x"]')!.innerHTML).toBe('old');
+    expect(rt.get('x')).toBeUndefined();
+    expect(cb).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(3);
+    rt.destroy();
+  });
+});
+
+describe('first frame', () => {
+  it('the first frame is not hello', () => {
+    const rt = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    rt.onConnect(() => rt.set('x', 1 as unknown as never));
+    latestMockWs().serverOpen();
+    expect(latestMockWs().sentMessages.map((m) => JSON.parse(m))).toEqual([{ t: 'write', routeKey: '3f7a', var: 'x', value: 1 }]);
+    rt.destroy();
+  });
+});
+
+describe('close codes', () => {
+  it('does not reconnect after close code 1001', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    latestMockWs().serverClose(1001, 'going away');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    rt.destroy();
+  });
+
+  it('close 4000 after 30 s open reconnects at once', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    vi.advanceTimersByTime(30_000);
+    latestMockWs().serverClose(StatusReauth, 'reauth');
+    expect(mockWsInstances).toHaveLength(2);
+    rt.destroy();
+  });
+
+  it('close 4000 right after open waits the back-off', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    vi.advanceTimersByTime(29_000);
+    latestMockWs().serverClose(StatusReauth, 'reauth');
+    vi.advanceTimersByTime(800);
+    expect(mockWsInstances).toHaveLength(1);
+    vi.advanceTimersByTime(400);
+    expect(mockWsInstances).toHaveLength(2);
+    rt.destroy();
+  });
+
+  it('other closes keep the back-off', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    latestMockWs().serverClose(1011, 'internal error');
+    vi.advanceTimersByTime(800);
+    expect(mockWsInstances).toHaveLength(1);
+    vi.advanceTimersByTime(400);
+    expect(mockWsInstances).toHaveLength(2);
+    rt.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hidden tab
+// ---------------------------------------------------------------------------
+
+describe('hidden tab', () => {
+  it('hidden tab closes the connection and visible reopens it', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<span data-ssr-bind="x"></span><span data-ssr-bind="y"></span>';
+    const rt = makeRuntime();
+    const disconnectCb = vi.fn();
+    rt.onDisconnect(disconnectCb);
+    sendInit({ x: 'one', y: '<b>a</b>' });
+    const ws1 = latestMockWs();
+
+    setVisibility('hidden');
+    expect(ws1.clientClose).toEqual({ code: 1000, reason: expect.any(String) });
+    expect(getSharedConnectionRegistry().get('ws://localhost/__ws')!.isPaused()).toBe(true);
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    expect(disconnectCb).not.toHaveBeenCalled();
+
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(2);
+    expect(getSharedConnectionRegistry().get('ws://localhost/__ws')!.isPaused()).toBe(false);
+    latestMockWs().serverOpen();
+    expect(latestMockWs().sentMessages).toHaveLength(0);
+    sendInit({ x: 'two', y: '<b>b</b>' });
+    expect(document.querySelector('[data-ssr-bind="x"]')!.textContent).toBe('two');
+    expect(document.querySelector('[data-ssr-bind="y"]')!.innerHTML).toBe('<b>b</b>');
+    expect(rt.get('x')).toBe('two');
+    rt.destroy();
+  });
+
+  it('hidden tab cancels a pending reconnect and visible reconnects at once', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    latestMockWs().serverClose(1006, 'gone');
+    setVisibility('hidden');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(2);
+    rt.destroy();
+  });
+
+  it('hidden tab while connecting does not report a refused upgrade', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const rt = new SsrRuntime('ws://localhost/__ws');
+    const connectErrorCb = vi.fn();
+    rt.onConnectError(connectErrorCb);
+    setVisibility('hidden');
+    expect(latestMockWs().clientClose).not.toBeNull();
+    expect(connectErrorCb).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(2);
+    rt.destroy();
+  });
+
+  it('a refused upgrade after the tab is shown again retries with the back-off', () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const rt = makeRuntime();
+    const connectErrorCb = vi.fn();
+    rt.onConnectError(connectErrorCb);
+    setVisibility('hidden');
+    setVisibility('visible');
+
+    for (const wait of [1200, 2400]) {
+      latestMockWs().serverError();
+      latestMockWs().serverClose(1006, '');
+      vi.advanceTimersByTime(wait);
+    }
+    expect(mockWsInstances).toHaveLength(4);
+    latestMockWs().serverOpen();
+    expect(latestMockWs().sentMessages).toHaveLength(0);
+    expect(connectErrorCb).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    // Once a socket opened again, a refused upgrade is final as before.
+    sendInit({});
+    latestMockWs().serverClose(1006, 'gone');
+    vi.advanceTimersByTime(1200);
+    latestMockWs().serverError();
+    latestMockWs().serverClose(1006, '');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(5);
+    expect(connectErrorCb).toHaveBeenCalledOnce();
+    rt.destroy();
+  });
+
+  it('a refused first upgrade in a tab hidden at load stays final', () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    const rt = new SsrRuntime('ws://localhost/__ws');
+    const connectErrorCb = vi.fn();
+    rt.onConnectError(connectErrorCb);
+    setVisibility('visible');
+    latestMockWs().serverError();
+    latestMockWs().serverClose(1006, '');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    expect(connectErrorCb).toHaveBeenCalledOnce();
+    rt.destroy();
+  });
+
+  it('a server close 1000 while visible stays final', () => {
+    vi.useFakeTimers();
+    const rt = makeRuntime();
+    latestMockWs().serverClose(1000, 'normal');
+    setVisibility('hidden');
+    setVisibility('visible');
+    vi.advanceTimersByTime(60_000);
+    expect(mockWsInstances).toHaveLength(1);
+    rt.destroy();
+  });
+
+  it('a tab hidden at load connects when first shown', () => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.body.innerHTML = '<span data-ssr-bind="x">ssr-x</span><span data-ssr-bind="y">ssr-y</span>';
+    const rt = new SsrRuntime('ws://localhost/__ws');
+    expect(mockWsInstances).toHaveLength(0);
+
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(1);
+    latestMockWs().serverOpen();
+    expect(latestMockWs().sentMessages).toHaveLength(0);
+    sendInit({ x: 'live-x', y: '<b>live-y</b>' });
+    expect(document.querySelector('[data-ssr-bind="x"]')!.textContent).toBe('live-x');
+    expect(document.querySelector('[data-ssr-bind="y"]')!.innerHTML).toBe('<b>live-y</b>');
+    rt.destroy();
+  });
+
+  it('destroy stops watching the tab', () => {
+    const rt = makeRuntime();
+    rt.destroy();
+    setVisibility('hidden');
+    setVisibility('visible');
+    expect(mockWsInstances).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ssr:bind with two routes on one page
+// ---------------------------------------------------------------------------
+
+describe('ssr:bind with two routes on one page', () => {
+  function twoRoutes(): { root: SsrRuntime; home: SsrRuntime; input: HTMLInputElement } {
+    document.body.innerHTML = '<input ssr:bind="displayName" data-ssr-route="9d1e" type="text" />';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    latestMockWs().serverOpen();
+    sendInit({ '3f7a.title': 'Home', '9d1e.displayName': '&lt;Bob&gt;' }, '9d1e');
+    return { root, home, input: document.querySelector('input')! };
+  }
+
+  function type(input: HTMLInputElement, value: string): void {
+    input.value = value;
+    input.dispatchEvent(new Event('input'));
+  }
+
+  it('typing sends exactly one write, from the owner', () => {
+    const { root, home, input } = twoRoutes();
+    type(input, 'Alice');
+    expect(latestMockWs().sentMessages.map((m) => JSON.parse(m))).toEqual([
+      { t: 'write', routeKey: '9d1e', var: 'displayName', value: 'Alice' },
+    ]);
+    root.destroy();
+    home.destroy();
+  });
+
+  it('after an ack the input keeps the typed value', () => {
+    const { root, home, input } = twoRoutes();
+    root.onError(() => {});
+    type(input, 'Alice');
+    // The server acks the owner's write and refuses any other route's.
+    for (const m of latestMockWs().sentMessages) {
+      const { routeKey, var: name } = JSON.parse(m);
+      latestMockWs().serverSend(JSON.stringify(routeKey === '9d1e'
+        ? { t: 'ack', routeKey, var: name }
+        : { t: 'err', routeKey, var: name, msg: 'unknown variable', code: 'validation_failed' }));
+    }
+    expect(input.value).toBe('Alice');
+    root.destroy();
+    home.destroy();
+  });
+
+  it("after an err from the owner the input resets to the owner's last value", () => {
+    const { root, home, input } = twoRoutes();
+    home.onError(() => {});
+    type(input, 'Alice');
+    latestMockWs().serverSend(JSON.stringify({
+      t: 'err', routeKey: '9d1e', var: 'displayName', msg: 'too short', code: 'validation_failed',
+    }));
+    expect(input.value).toBe('<Bob>');
+    root.destroy();
+    home.destroy();
+  });
+
+  it('an err about a variable the route does not own leaves the input alone', () => {
+    const { root, home, input } = twoRoutes();
+    const rootErrors = vi.fn();
+    root.onError(rootErrors);
+    type(input, 'Alice');
+    latestMockWs().serverSend(JSON.stringify({
+      t: 'err', routeKey: '3f7a', var: 'displayName', msg: 'unknown variable', code: 'validation_failed',
+    }));
+    expect(input.value).toBe('Alice');
+    expect(rootErrors).toHaveBeenCalledWith('displayName', 'unknown variable');
+    root.destroy();
+    home.destroy();
+  });
+
+  it('same-named variables in two routes: each input writes to its own route', () => {
+    document.body.innerHTML =
+      '<input id="r" ssr:bind="name" data-ssr-route="3f7a" type="text" />' +
+      '<input id="h" ssr:bind="name" data-ssr-route="9d1e" type="text" />';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    const ws = latestMockWs();
+    ws.serverOpen();
+    sendInit({ '3f7a.name': 'R', '9d1e.name': 'H' });
+    const r = document.querySelector<HTMLInputElement>('#r')!;
+    const h = document.querySelector<HTMLInputElement>('#h')!;
+    expect(r.value).toBe('R');
+    expect(h.value).toBe('H');
+
+    type(r, 'r1');
+    type(h, 'h1');
+    expect(ws.sentMessages.map((m) => JSON.parse(m))).toEqual([
+      { t: 'write', routeKey: '3f7a', var: 'name', value: 'r1' },
+      { t: 'write', routeKey: '9d1e', var: 'name', value: 'h1' },
+    ]);
+
+    root.onError(() => {});
+    ws.serverSend(JSON.stringify({ t: 'err', routeKey: '3f7a', var: 'name', msg: 'bad', code: 'validation_failed' }));
+    expect(r.value).toBe('R');
+    expect(h.value).toBe('h1');
+    root.destroy();
+    home.destroy();
+  });
+
+  it('a variable the route never renders on its own is written by its owner', () => {
+    document.body.innerHTML = '<input ssr:bind="note" data-ssr-route="9d1e" type="text" />';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    latestMockWs().serverOpen();
+    sendInit({ '3f7a.title': 'Home', '9d1e.a1b2c3d4e5f60708': 'x' });
+    type(document.querySelector('input')!, 'hello');
+    expect(latestMockWs().sentMessages.map((m) => JSON.parse(m))).toEqual([
+      { t: 'write', routeKey: '9d1e', var: 'note', value: 'hello' },
+    ]);
+    root.destroy();
+    home.destroy();
+  });
+
+  it('an unmarked input on a page with two routes is claimed by neither', () => {
+    document.body.innerHTML = '<input ssr:bind="displayName" type="text" />';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    const ws = latestMockWs();
+    ws.serverOpen();
+    sendInit({ '3f7a.displayName': 'A', '9d1e.displayName': 'B' });
+    const input = document.querySelector('input')!;
+    expect(input.value).toBe('');
+    type(input, 'Alice');
+    expect(ws.sentMessages).toHaveLength(0);
+    home.onError(() => {});
+    ws.serverSend(JSON.stringify({ t: 'err', routeKey: '9d1e', var: 'displayName', msg: 'bad', code: 'validation_failed' }));
+    expect(input.value).toBe('Alice');
+    root.destroy();
+    home.destroy();
+  });
+
+  it("a patch of the owner's variable updates the input", () => {
+    const { root, home, input } = twoRoutes();
+    sendPatch('9d1e.displayName', 'Carol &amp; Dave', '9d1e');
+    expect(input.value).toBe('Carol & Dave');
+    root.destroy();
+    home.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime registration, destroy and ssr:bind edge cases
+// ---------------------------------------------------------------------------
+
+describe('get and on with variable names', () => {
+  it("a route reads its own variables by name", () => {
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const cb = vi.fn();
+    rt.on('count', cb);
+    sendInit({ '3f7a.count': '5', '9d1e.count': '7' }, '9d1e');
+    expect(rt.get('count')).toBe('5');
+    expect(cb).toHaveBeenCalledOnce();
+    expect(cb).toHaveBeenCalledWith('5');
+    sendPatch('9d1e.count', '8', '9d1e');
+    sendPatch('3f7a.count', '6', '3f7a');
+    expect(rt.get('count')).toBe('6');
+    expect(cb).toHaveBeenLastCalledWith('6');
+    expect(cb).toHaveBeenCalledTimes(2);
+    rt.destroy();
+  });
+
+  it('a route with a route key does not read bare keys', () => {
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const cb = vi.fn();
+    rt.on('count', cb);
+    sendInit({ count: '5' });
+    expect(rt.get('count')).toBeUndefined();
+    expect(cb).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+});
+
+describe('destroy', () => {
+  function twoRuntimes(): { root: SsrRuntime; home: SsrRuntime; input: HTMLInputElement } {
+    document.body.innerHTML = '<input ssr:bind="name" data-ssr-route="9d1e" type="text" />';
+    const root = new SsrRuntime('ws://localhost/__ws', '3f7a');
+    const home = new SsrRuntime('ws://localhost/__ws', '9d1e');
+    latestMockWs().serverOpen();
+    return { root, home, input: document.querySelector('input')! };
+  }
+
+  it('removes the ssr:bind listeners', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { root, home, input } = twoRuntimes();
+    home.destroy();
+    input.value = 'Alice';
+    input.dispatchEvent(new Event('input'));
+    expect(latestMockWs().sentMessages).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+    root.destroy();
+  });
+
+  it('set after destroy sends nothing and warns', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { root, home } = twoRuntimes();
+    home.destroy();
+    home.set('name' as never, 'Alice' as never);
+    expect(latestMockWs().sentMessages).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('destroyed'));
+    root.destroy();
+  });
+});
+
+describe('ssr:bind input marked with a route no runtime has', () => {
+  it.each([[['3f7a']], [['3f7a', '9d1e']]])('runtimes %j leave it alone', (routeKeys) => {
+    document.body.innerHTML = '<input ssr:bind="name" data-ssr-route="dead" type="text" value="v" />';
+    const runtimes = routeKeys.map((k) => new SsrRuntime('ws://localhost/__ws', k));
+    runtimes.forEach((rt) => rt.onError(() => {}));
+    const ws = latestMockWs();
+    ws.serverOpen();
+    const input = document.querySelector('input')!;
+    sendInit(Object.fromEntries(routeKeys.map((k) => [k + '.name', 'init'])));
+    routeKeys.forEach((k) => sendPatch(k + '.name', 'patch', k));
+    expect(input.value).toBe('v');
+
+    input.value = 'typed';
+    input.dispatchEvent(new Event('input'));
+    expect(ws.sentMessages).toHaveLength(0);
+    routeKeys.forEach((k) => ws.serverSend(JSON.stringify({
+      t: 'err', routeKey: k, var: 'name', msg: 'bad', code: 'validation_failed',
+    })));
+    expect(input.value).toBe('typed');
+    runtimes.forEach((rt) => rt.destroy());
+  });
+});
+
+describe('two runtimes with the same route key', () => {
+  it('both stay registered, count as two and are warned about', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    document.body.innerHTML = '<input ssr:bind="name" type="text" />';
+    const a = new SsrRuntime('ws://localhost/__ws');
+    const b = new SsrRuntime('ws://localhost/__ws');
+    expect(warnSpy).toHaveBeenCalledWith('[gossr] Two runtimes on this page share the route key "".');
+    const aConnect = vi.fn();
+    const bConnect = vi.fn();
+    a.onConnect(aConnect);
+    b.onConnect(bConnect);
+    const ws = latestMockWs();
+    ws.serverOpen();
+    expect(aConnect).toHaveBeenCalledOnce();
+    expect(bConnect).toHaveBeenCalledOnce();
+
+    const input = document.querySelector('input')!;
+    input.value = 'x';
+    input.dispatchEvent(new Event('input'));
+    expect(ws.sentMessages).toHaveLength(0);
+
+    a.destroy();
+    expect(ws.clientClose).toBeNull();
+    input.value = 'y';
+    input.dispatchEvent(new Event('input'));
+    expect(ws.sentMessages.map((m) => JSON.parse(m))).toEqual([{ t: 'write', routeKey: '', var: 'name', value: 'y' }]);
+    b.destroy();
+  });
+});
+
+describe('ssr:bind echo', () => {
+  it('leaves a focused input as it is', () => {
+    document.body.innerHTML = '<input ssr:bind="name" data-ssr-route="3f7a" type="text" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const input = document.querySelector('input')!;
+    input.focus();
+    input.value = 'Ali';
+    sendPatch('3f7a.name', 'Bob', '3f7a');
+    expect(input.value).toBe('Ali');
+    input.blur();
+    sendPatch('3f7a.name', 'Carol', '3f7a');
+    expect(input.value).toBe('Carol');
+    rt.destroy();
+  });
+
+  it('sets a focused checkbox and radio by checked', () => {
+    document.body.innerHTML =
+      '<input ssr:bind="done" data-ssr-route="3f7a" type="checkbox" />' +
+      '<input ssr:bind="mode" data-ssr-route="3f7a" type="radio" name="m" value="fast" />';
+    const rt = makeRuntime('ws://localhost/__ws', '3f7a');
+    const [box, radio] = Array.from(document.querySelectorAll<HTMLInputElement>('input'));
+    box.focus();
+    sendPatch('3f7a.done', 'true', '3f7a');
+    expect(box.checked).toBe(true);
+    radio.focus();
+    sendPatch('3f7a.mode', 'fast', '3f7a');
+    expect(radio.checked).toBe(true);
+    expect(radio.value).toBe('fast');
     rt.destroy();
   });
 });

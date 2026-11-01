@@ -1,6 +1,6 @@
 {
   "name": "gossr-runtime",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "TypeScript runtime for GoSSR reactive bindings.",
   "type": "module",
   "license": "MIT",

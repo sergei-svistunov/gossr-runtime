@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { StatusReauth } from '../src/protocol.js';
 import type {
   InitFrame,
   PatchFrame,
@@ -15,6 +16,10 @@ import type {
 } from '../src/protocol.js';
 
 describe('protocol shapes match spec section 4', () => {
+  it('the reconnect-now close code is 4000', () => {
+    expect(StatusReauth).toBe(4000);
+  });
+
   it('InitFrame: t=init, routeKey, bindings is Record<string,string>', () => {
     const frame: InitFrame = {
       t: 'init',

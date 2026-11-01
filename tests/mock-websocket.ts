@@ -28,6 +28,10 @@ export class MockWebSocketImpl implements MockWebSocket {
   readyState: number = MockWebSocketImpl.CONNECTING;
   readonly url: string;
   readonly sentMessages: string[] = [];
+  /** Code and reason the client passed to close(), if it closed the socket itself. */
+  clientClose: { code: number; reason: string } | null = null;
+  /** When set, close() on an open socket only records; the test fires the close event. */
+  deferClose = false;
 
   private listeners: Map<string, Set<(event: Event | MessageEvent | CloseEvent) => void>> = new Map();
 
@@ -62,8 +66,20 @@ export class MockWebSocketImpl implements MockWebSocket {
     this.sentMessages.push(data);
   }
 
-  close(code = 1000, _reason = ''): void {
-    this.readyState = MockWebSocketImpl.CLOSED;
+  close(code = 1000, reason = ''): void {
+    if (this.readyState === MockWebSocketImpl.CLOSED) return;
+    this.clientClose = { code, reason };
+    if (this.readyState === MockWebSocketImpl.CONNECTING) {
+      // Closing before the handshake completes fails the connection, as in browsers.
+      this.serverError();
+      this.serverClose(1006, '');
+      return;
+    }
+    if (this.deferClose) {
+      this.readyState = MockWebSocketImpl.CLOSING;
+      return;
+    }
+    this.serverClose(code, reason);
   }
 
   // -------------------------------------------------------------------------
